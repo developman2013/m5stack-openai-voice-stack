@@ -1,0 +1,38 @@
+name: OpenAI Voice Gateway
+version: "0.1.0"
+slug: openai_voice_gateway
+description: Realtime OpenAI voice gateway with a browser demo and Home Assistant hooks
+url: https://platform.openai.com/
+startup: services
+boot: auto
+init: false
+host_network: true
+hassio_api: true
+homeassistant_api: true
+webui: http://[HOST]:[PORT:8765]
+arch:
+  - aarch64
+  - amd64
+  - armv7
+ports:
+  8765/tcp: 8765
+ports_description:
+  8765/tcp: Browser demo and websocket endpoint
+options:
+  openai_api_key: ""
+  openai_model: gpt-realtime-mini
+  openai_voice: cedar
+  instructions: >-
+    You are a concise, helpful smart home voice assistant. Keep responses short
+    unless more detail is requested.
+  home_assistant_url: http://supervisor/core
+  home_assistant_token: ""
+  listen_port: 8765
+schema:
+  openai_api_key: password
+  openai_model: str
+  openai_voice: str
+  instructions: str
+  home_assistant_url: str
+  home_assistant_token: password
+  listen_port: port
