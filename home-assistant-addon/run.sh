@@ -10,4 +10,5 @@ if [ -z "$HOME_ASSISTANT_TOKEN" ] && [ -n "${SUPERVISOR_TOKEN:-}" ]; then
 fi
 export HOME_ASSISTANT_TOKEN
 export LISTEN_PORT="$(bashio::config 'listen_port')"
+export LAST_INPUT_PCM_PATH="$(bashio::config 'last_input_pcm_path')"
 exec python3 -m app.main

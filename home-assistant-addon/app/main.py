@@ -1,10 +1,14 @@
+from __future__ import annotations
+
 import asyncio
 import base64
 import json
 import os
 import struct
+import time
 from contextlib import suppress
-from typing import Any
+from collections import deque
+from typing import Any, Optional
 
 import httpx
 import websockets
@@ -16,14 +20,18 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-realtime-mini")
 OPENAI_VOICE = os.getenv("OPENAI_VOICE", "cedar")
 ASSISTANT_INSTRUCTIONS = os.getenv(
     "ASSISTANT_INSTRUCTIONS",
-    "You are a concise, helpful smart home voice assistant.",
+    "You are a concise, helpful smart home voice assistant. "
+    "Always answer in Russian unless the user clearly speaks another language. "
+    "Keep answers short and natural for spoken conversation.",
 )
 HOME_ASSISTANT_URL = os.getenv("HOME_ASSISTANT_URL", "http://supervisor/core")
 HOME_ASSISTANT_TOKEN = os.getenv("HOME_ASSISTANT_TOKEN", "")
 LISTEN_PORT = int(os.getenv("LISTEN_PORT", "8765"))
 REALTIME_URL = f"wss://api.openai.com/v1/realtime?model={OPENAI_MODEL}"
 AUDIO_DELTA_SLICE_BYTES = 1920
-LAST_INPUT_PCM_PATH = "/tmp/openai-last-input.pcm"
+MAX_PENDING_AUDIO_EVENTS = 6
+MAX_DEVICE_AUDIO_SLOTS = int(os.getenv("MAX_DEVICE_AUDIO_SLOTS", "32"))
+LAST_INPUT_PCM_PATH = os.getenv("LAST_INPUT_PCM_PATH", "/tmp/openai-last-input.pcm")
 
 HA_TOOL_DEFINITIONS = [
     {
@@ -291,7 +299,7 @@ async def ha_get(path: str) -> tuple[int, Any]:
     return response.status_code, body
 
 
-async def ha_post(path: str, payload: dict | None = None) -> tuple[int, Any]:
+async def ha_post(path: str, payload: Optional[dict] = None) -> tuple[int, Any]:
     url = f"{HOME_ASSISTANT_URL}{path}"
     async with httpx.AsyncClient(timeout=20.0) as client:
         response = await client.post(url, headers=ha_headers(), json=payload or {})
@@ -303,7 +311,7 @@ async def ha_post(path: str, payload: dict | None = None) -> tuple[int, Any]:
 
 
 @app.post("/ha/service/{domain}/{service}")
-async def call_ha_service(domain: str, service: str, payload: dict | None = None):
+async def call_ha_service(domain: str, service: str, payload: Optional[dict] = None):
     status_code, body = await ha_post(f"/api/services/{domain}/{service}", payload)
     return JSONResponse(status_code=status_code, content=body)
 
@@ -321,13 +329,20 @@ async def configure_openai(ws):
                 "type": "session.update",
                 "session": {
                     "type": "realtime",
+                    "audio": {
+                        "input": {
+                            "turn_detection": None,
+                        },
+                    },
                     "instructions": ASSISTANT_INSTRUCTIONS
                     + "\n\nYou can use Home Assistant tools during the conversation."
                     + "\n- Use search_entities if you do not know the exact entity id."
                     + "\n- Use get_entity_state before acting if status matters."
                     + "\n- Use call_home_assistant_service for control actions."
                     + "\n- Ask a short confirmation before ambiguous or impactful actions."
-                    + "\n- Keep spoken replies concise.",
+                    + "\n- Reply in Russian by default."
+                    + "\n- Keep spoken replies concise, usually one or two short sentences."
+                    + "\n- Avoid long introductions and avoid lists unless the user asks for them.",
                     "tools": HA_TOOL_DEFINITIONS,
                     "tool_choice": "auto",
                 },
@@ -421,8 +436,51 @@ async def relay(client_ws: WebSocket):
             raw_turn_audio = bytearray()
             sent_audio_bytes = 0
             commit_requested = False
+            output_audio_chunks = 0
+            last_output_audio_delta_at = 0.0
+            pending_audio_events: deque[dict[str, Any]] = deque()
+            client_send_lock = asyncio.Lock()
+            device_audio_slots = 0
+            gateway_response_id = 0
+            gateway_audio_seq = 0
 
             await configure_openai(openai_ws)
+
+            async def send_requested_audio(
+                slot_count: Optional[int] = None,
+                additive: bool = False,
+            ) -> None:
+                nonlocal device_audio_slots
+                async with client_send_lock:
+                    if slot_count is not None:
+                        if additive:
+                            device_audio_slots = min(
+                                MAX_DEVICE_AUDIO_SLOTS,
+                                device_audio_slots + max(0, slot_count),
+                            )
+                        else:
+                            device_audio_slots = min(
+                                MAX_DEVICE_AUDIO_SLOTS,
+                                max(0, slot_count),
+                            )
+
+                    sent = 0
+                    while device_audio_slots > 0 and pending_audio_events:
+                        event = pending_audio_events.popleft()
+                        await client_ws.send_text(json.dumps(event))
+                        device_audio_slots -= 1
+                        sent += 1
+
+                if sent:
+                    log(
+                        f"sent {sent} audio chunks to device "
+                        f"({device_audio_slots} slots remaining)"
+                    )
+                if pending_audio_events and device_audio_slots == 0:
+                    log(
+                        "gateway audio backlog: "
+                        f"{len(pending_audio_events)} chunks waiting on device buffer"
+                    )
 
             async def flush_buffered_audio() -> None:
                 nonlocal buffered_audio, sent_audio_bytes
@@ -443,7 +501,8 @@ async def relay(client_ws: WebSocket):
                 )
 
             async def client_to_openai():
-                nonlocal audio_chunks, buffered_audio, raw_turn_audio, sent_audio_bytes, commit_requested
+                nonlocal audio_chunks, buffered_audio, raw_turn_audio
+                nonlocal sent_audio_bytes, commit_requested
                 try:
                     while True:
                         message = await client_ws.receive()
@@ -454,6 +513,10 @@ async def relay(client_ws: WebSocket):
                         if not openai_ready.is_set():
                             await openai_ready.wait()
                         if kind == "append_audio":
+                            if audio_chunks == 0 and sent_audio_bytes == 0 and not buffered_audio:
+                                await openai_ws.send(
+                                    json.dumps({"type": "input_audio_buffer.clear"})
+                                )
                             audio_chunks += 1
                             audio_b64 = str(payload.get("audio", ""))
                             if audio_b64:
@@ -470,8 +533,11 @@ async def relay(client_ws: WebSocket):
                             if sent_audio_bytes == 0:
                                 log("ignoring empty commit")
                                 continue
-                            with open(LAST_INPUT_PCM_PATH, "wb") as pcm_file:
-                                pcm_file.write(raw_turn_audio)
+                            try:
+                                with open(LAST_INPUT_PCM_PATH, "wb") as pcm_file:
+                                    pcm_file.write(raw_turn_audio)
+                            except OSError as exc:
+                                log(f"failed to persist turn audio: {exc}")
                             stats = analyze_pcm16(bytes(raw_turn_audio))
                             log(
                                 "turn audio stats: "
@@ -483,15 +549,30 @@ async def relay(client_ws: WebSocket):
                             sent_audio_bytes = 0
                             raw_turn_audio.clear()
                             audio_chunks = 0
+                        elif kind == "audio_request":
+                            free_slots = int(payload.get("slots", 0) or 0)
+                            requested_slots = max(0, free_slots)
+                            if requested_slots == 0 or requested_slots >= 4:
+                                log(f"device requested audio slots: {requested_slots}")
+                            await send_requested_audio(requested_slots, additive=True)
+                            continue
+                        elif kind == "playback_status":
+                            free_slots = int(payload.get("free_slots", 0) or 0)
+                            await send_requested_audio(max(0, free_slots))
+                            continue
                         elif kind == "response.create":
                             await openai_ws.send(json.dumps({"type": "response.create"}))
+                        elif kind in {"ping", "pong"}:
+                            continue
                         else:
+                            log(f"forwarding passthrough event from device: {kind}")
                             await openai_ws.send(json.dumps(payload))
                 except (WebSocketDisconnect, RuntimeError):
                     pass
 
             async def openai_to_client():
-                nonlocal commit_requested
+                nonlocal commit_requested, output_audio_chunks, last_output_audio_delta_at
+                nonlocal gateway_response_id, gateway_audio_seq
                 async for message in openai_ws:
                     event = json.loads(message)
                     event_type = event.get("type", "unknown")
@@ -508,6 +589,27 @@ async def relay(client_ws: WebSocket):
                         "error",
                     }:
                         log(f"OpenAI event: {event_type}")
+                    if event_type == "response.output_audio.delta":
+                        now = time.monotonic()
+                        output_audio_chunks += 1
+                        if last_output_audio_delta_at:
+                            gap_ms = (now - last_output_audio_delta_at) * 1000
+                            if gap_ms > 120:
+                                log(
+                                    "OpenAI audio delta gap: "
+                                    f"{gap_ms:.1f} ms before chunk {output_audio_chunks}"
+                                )
+                        last_output_audio_delta_at = now
+                    if event_type == "response.created":
+                        gateway_response_id += 1
+                        gateway_audio_seq = 0
+                        if pending_audio_events:
+                            log(
+                                "dropping unsent audio from previous response: "
+                                f"{len(pending_audio_events)} chunks"
+                            )
+                            pending_audio_events.clear()
+                        log(f"gateway response_id={gateway_response_id} started")
                     if event_type == "session.updated":
                         openai_ready.set()
                         log("OpenAI realtime session is ready")
@@ -540,15 +642,42 @@ async def relay(client_ws: WebSocket):
                     if event_type == "input_audio_buffer.committed" and commit_requested:
                         log("creating response after committed audio buffer")
                         commit_requested = False
+                        output_audio_chunks = 0
+                        last_output_audio_delta_at = 0.0
+                        pending_audio_events.clear()
                         await openai_ws.send(json.dumps({"type": "response.create"}))
                     if (
                         event_type == "error"
                         and event.get("error", {}).get("code") == "input_audio_buffer_commit_empty"
                     ):
                         commit_requested = False
+                    if event_type == "response.done":
+                        output_audio_chunks = 0
+                        last_output_audio_delta_at = 0.0
+                    if event_type == "response.output_audio.delta":
+                        delta = event.get("delta")
+                        if isinstance(delta, str):
+                            raw = base64.b64decode(delta)
+                            if len(raw) > AUDIO_DELTA_SLICE_BYTES:
+                                log(f"splitting audio delta of {len(raw)} bytes")
+                            for start in range(0, len(raw), AUDIO_DELTA_SLICE_BYTES):
+                                pending_audio_events.append(
+                                    {
+                                        **event,
+                                        "response_id": gateway_response_id,
+                                        "audio_seq": gateway_audio_seq,
+                                        "delta": base64.b64encode(
+                                            raw[start:start + AUDIO_DELTA_SLICE_BYTES]
+                                        ).decode("ascii"),
+                                    }
+                                )
+                                gateway_audio_seq += 1
+                            await send_requested_audio()
+                            continue
                     if event_type == "error":
                         log(f"OpenAI error payload: {json.dumps(event)}")
-                    await send_event_to_client(client_ws, event)
+                    async with client_send_lock:
+                        await send_event_to_client(client_ws, event)
 
             tasks = [
                 asyncio.create_task(client_to_openai()),

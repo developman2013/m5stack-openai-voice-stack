@@ -38,6 +38,9 @@ constexpr i2s_port_t I2S_PORT_AUDIO = I2S_NUM_0;
 constexpr uint32_t BUTTON_DEBOUNCE_MS = 30;
 constexpr uint32_t WIFI_RETRY_MS = 5000;
 constexpr uint32_t WS_RECONNECT_MS = 2000;
+constexpr size_t PLAYBACK_MAX_BUFFER_CHUNKS = MAX_PLAYBACK_QUEUE_CHUNKS;
+constexpr size_t PLAYBACK_START_BUFFER_CHUNKS = 8;
+constexpr uint32_t PLAYBACK_IDLE_RESET_MS = 250;
 
 enum class DeviceState {
   Booting,
@@ -68,15 +71,18 @@ bool listening = false;
 bool buttonPressed = false;
 uint32_t lastButtonChangeMs = 0;
 AudioMode audioMode = AudioMode::None;
+uint32_t outboundAudioChunksQueued = 0;
+uint32_t outboundAudioChunksSent = 0;
 
 std::deque<std::vector<uint8_t>> playbackQueue;
 std::deque<String> outboundQueue;
 
-constexpr char FIRMWARE_VERSION[] = "rt-gw-0.2";
+constexpr char FIRMWARE_VERSION[] = "rt-gw-0.6";
 
 void stopAudioI2S();
 void configureMicrophoneI2S();
 void configureSpeakerI2S();
+void requestPlaybackAudio(size_t slots);
 
 String base64Encode(const uint8_t* data, size_t length) {
   size_t outputLength = 0;
@@ -196,6 +202,8 @@ void startListening() {
 
   configureMicrophoneI2S();
   listening = true;
+  outboundAudioChunksQueued = 0;
+  outboundAudioChunksSent = 0;
   setState(DeviceState::Listening);
   refreshLed();
   Serial.println("[voice] listening started");
@@ -217,12 +225,43 @@ void enqueuePlayback(std::vector<uint8_t>&& chunk) {
     return;
   }
 
+  size_t queuedChunks = 0;
   portENTER_CRITICAL(&playbackMux);
-  if (playbackQueue.size() >= MAX_PLAYBACK_QUEUE_CHUNKS) {
-    playbackQueue.pop_front();
+  if (playbackQueue.size() >= PLAYBACK_MAX_BUFFER_CHUNKS) {
+    queuedChunks = playbackQueue.size();
+    portEXIT_CRITICAL(&playbackMux);
+    Serial.printf("[playback.enqueue] overflow at %u chunks, dropping newest chunk\n",
+                  static_cast<unsigned>(queuedChunks));
+    return;
   }
   playbackQueue.emplace_back(std::move(chunk));
+  queuedChunks = playbackQueue.size();
   portEXIT_CRITICAL(&playbackMux);
+
+  static uint32_t lastEnqueueMs = 0;
+  const uint32_t now = millis();
+  if (lastEnqueueMs != 0) {
+    const uint32_t gapMs = now - lastEnqueueMs;
+    if (gapMs > 120) {
+      Serial.printf("[playback.enqueue] gap=%lu ms queued=%u\n",
+                    static_cast<unsigned long>(gapMs),
+                    static_cast<unsigned>(queuedChunks));
+    }
+  }
+  lastEnqueueMs = now;
+}
+
+void requestPlaybackAudio(size_t slots) {
+  if (!wsConnected || slots == 0) {
+    return;
+  }
+
+  JsonDocument doc;
+  doc["type"] = "audio_request";
+  doc["slots"] = slots;
+  String payload;
+  serializeJson(doc, payload);
+  enqueueOutbound(std::move(payload));
 }
 
 bool dequeuePlayback(std::vector<uint8_t>& chunk) {
@@ -405,6 +444,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 
     case WStype_CONNECTED:
       wsConnected = true;
+      requestPlaybackAudio(PLAYBACK_MAX_BUFFER_CHUNKS);
       setState(DeviceState::Idle);
       refreshLed();
       Serial.printf("[ws] connected to %s\n", payload);
@@ -501,14 +541,39 @@ void microphoneTask(void*) {
     doc["audio"] = audioB64;
     String payload;
     serializeJson(doc, payload);
+    outboundAudioChunksQueued++;
+    if (outboundAudioChunksQueued <= 3 || outboundAudioChunksQueued % 25 == 0) {
+      Serial.printf("[mic.send] queued chunk=%lu bytes=%u b64=%u\n",
+                    static_cast<unsigned long>(outboundAudioChunksQueued),
+                    static_cast<unsigned>(monoBytes),
+                    static_cast<unsigned>(audioB64.length()));
+    }
     enqueueOutbound(std::move(payload));
   }
 }
 
 void playbackTask(void*) {
+  bool playbackPrimed = false;
+  uint32_t lastChunkPlayedMs = 0;
+
   while (true) {
+    size_t queuedChunks = 0;
+    portENTER_CRITICAL(&playbackMux);
+    queuedChunks = playbackQueue.size();
+    portEXIT_CRITICAL(&playbackMux);
+
+    if (!playbackPrimed && queuedChunks > 0 &&
+        queuedChunks < PLAYBACK_START_BUFFER_CHUNKS) {
+      vTaskDelay(pdMS_TO_TICKS(5));
+      continue;
+    }
+
     std::vector<uint8_t> chunk;
     if (!dequeuePlayback(chunk)) {
+      if (playbackPrimed && millis() - lastChunkPlayedMs > PLAYBACK_IDLE_RESET_MS) {
+        playbackPrimed = false;
+        Serial.println("[playback] buffer drained");
+      }
       if (!listening && wsConnected && deviceState == DeviceState::Playing) {
         setState(DeviceState::Idle);
         refreshLed();
@@ -525,6 +590,14 @@ void playbackTask(void*) {
       configureSpeakerI2S();
     }
 
+    if (!playbackPrimed) {
+      playbackPrimed = true;
+      Serial.printf("[playback] primed with %u queued chunks\n",
+                    static_cast<unsigned>(queuedChunks));
+    }
+
+    requestPlaybackAudio(1);
+
     const size_t monoSamples = chunk.size() / sizeof(int16_t);
     std::vector<int16_t> stereoSamples;
     stereoSamples.reserve(monoSamples * 2);
@@ -539,6 +612,7 @@ void playbackTask(void*) {
     i2s_write(I2S_PORT_AUDIO, stereoSamples.data(),
               stereoSamples.size() * sizeof(int16_t), &bytesWritten,
               portMAX_DELAY);
+    lastChunkPlayedMs = millis();
   }
 }
 
@@ -598,7 +672,16 @@ void loop() {
   String outbound;
   int sent = 0;
   while (wsConnected && sent < 4 && dequeueOutbound(outbound)) {
+    bool isAudioChunk = outbound.indexOf("\"type\":\"append_audio\"") >= 0;
     ws.sendTXT(outbound);
+    if (isAudioChunk) {
+      outboundAudioChunksSent++;
+      if (outboundAudioChunksSent <= 3 || outboundAudioChunksSent % 25 == 0) {
+        Serial.printf("[ws.send] audio chunk=%lu payload=%u\n",
+                      static_cast<unsigned long>(outboundAudioChunksSent),
+                      static_cast<unsigned>(outbound.length()));
+      }
+    }
     sent++;
     delay(1);
   }

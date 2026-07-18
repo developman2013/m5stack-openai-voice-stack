@@ -28,6 +28,7 @@ options:
   home_assistant_url: http://supervisor/core
   home_assistant_token: ""
   listen_port: 8765
+  last_input_pcm_path: /home/hassio/openai-last-input.pcm
 schema:
   openai_api_key: password
   openai_model: str
@@ -36,3 +37,4 @@ schema:
   home_assistant_url: str
   home_assistant_token: password
   listen_port: port
+  last_input_pcm_path: str

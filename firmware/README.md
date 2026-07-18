@@ -25,6 +25,16 @@ PlatformIO firmware for `M5Stack Atom Echo` that talks directly to the local voi
 2. Fill in Wi-Fi credentials and gateway address.
 3. Build and flash the firmware.
 
+## Working with local debug mode
+
+When the gateway runs locally on your development machine instead of inside Home Assistant:
+
+- set `GATEWAY_HOST` in `include/firmware_config.h` to the LAN IP or hostname of that machine
+- keep `GATEWAY_PORT` as `8765` unless you changed the local debug port
+- reflash the device after changing the gateway target
+
+When you switch back to the Home Assistant add-on, point `GATEWAY_HOST` back to your HA host again.
+
 ## Stable flashing workflow
 
 ```bash
