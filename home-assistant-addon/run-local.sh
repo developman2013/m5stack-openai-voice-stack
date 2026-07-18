@@ -18,6 +18,12 @@ export ASSISTANT_INSTRUCTIONS="${ASSISTANT_INSTRUCTIONS:-You are a concise, help
 export HOME_ASSISTANT_URL="${HOME_ASSISTANT_URL:-http://homeassistant.local:8123}"
 export LISTEN_PORT="${LISTEN_PORT:-8765}"
 export LAST_INPUT_PCM_PATH="${LAST_INPUT_PCM_PATH:-/tmp/openai-last-input.pcm}"
+export WAKE_WORD_ENABLED="${WAKE_WORD_ENABLED:-false}"
+export WAKE_WORD_HOST="${WAKE_WORD_HOST:-core-openwakeword}"
+export WAKE_WORD_PORT="${WAKE_WORD_PORT:-10400}"
+export WAKE_WORD_NAME="${WAKE_WORD_NAME:-hey_jarvis}"
+export WAKE_AUDIO_GAIN="${WAKE_AUDIO_GAIN:-8}"
+export FOLLOW_UP_TIMEOUT_MS="${FOLLOW_UP_TIMEOUT_MS:-5000}"
 
 if [ -z "${OPENAI_API_KEY:-}" ]; then
   echo "OPENAI_API_KEY is required. Copy .env.local.example to .env.local and fill it in." >&2

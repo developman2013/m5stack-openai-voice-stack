@@ -11,4 +11,10 @@ fi
 export HOME_ASSISTANT_TOKEN
 export LISTEN_PORT="$(bashio::config 'listen_port')"
 export LAST_INPUT_PCM_PATH="$(bashio::config 'last_input_pcm_path')"
+export WAKE_WORD_ENABLED="$(bashio::config 'wake_word_enabled')"
+export WAKE_WORD_HOST="$(bashio::config 'wake_word_host')"
+export WAKE_WORD_PORT="$(bashio::config 'wake_word_port')"
+export WAKE_WORD_NAME="$(bashio::config 'wake_word_name')"
+export WAKE_AUDIO_GAIN="$(bashio::config 'wake_audio_gain')"
+export FOLLOW_UP_TIMEOUT_MS="$(bashio::config 'follow_up_timeout_ms')"
 exec python3 -m app.main

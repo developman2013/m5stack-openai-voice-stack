@@ -5,7 +5,6 @@
 #include <driver/i2s.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
-#include <mbedtls/base64.h>
 
 #include <Adafruit_NeoPixel.h>
 #include <algorithm>
@@ -43,6 +42,11 @@ constexpr uint32_t WS_RECONNECT_MS = 2000;
 constexpr size_t PLAYBACK_MAX_BUFFER_CHUNKS = MAX_PLAYBACK_QUEUE_CHUNKS;
 constexpr size_t PLAYBACK_START_BUFFER_CHUNKS = 8;
 constexpr uint32_t PLAYBACK_IDLE_RESET_MS = 250;
+constexpr uint32_t WAKE_COMMAND_DELAY_MS = 300;
+constexpr uint32_t DEFAULT_FOLLOW_UP_TIMEOUT_MS = 5000;
+constexpr uint8_t AUDIO_FRAME_WAKE = 0;
+constexpr uint8_t AUDIO_FRAME_COMMAND = 1;
+constexpr size_t MAX_OUTBOUND_AUDIO_CHUNKS = 12;
 
 enum class DeviceState {
   Booting,
@@ -71,52 +75,30 @@ SemaphoreHandle_t audioIoMutex = nullptr;
 DeviceState deviceState = DeviceState::Booting;
 bool wsConnected = false;
 bool listening = false;
+bool wakeListening = false;
 bool buttonPressed = false;
+bool responsePlaybackComplete = false;
+bool followUpRequested = false;
 uint32_t lastButtonChangeMs = 0;
 AudioMode audioMode = AudioMode::None;
 uint32_t outboundAudioChunksQueued = 0;
 uint32_t outboundAudioChunksSent = 0;
+uint32_t commandAudioStartsAtMs = 0;
+uint32_t followUpDeadlineMs = 0;
+uint32_t followUpTimeoutMs = DEFAULT_FOLLOW_UP_TIMEOUT_MS;
 
 std::deque<std::vector<uint8_t>> playbackQueue;
 std::deque<String> outboundQueue;
+std::deque<std::vector<uint8_t>> outboundAudioQueue;
 
-constexpr char FIRMWARE_VERSION[] = "rt-gw-0.7";
+constexpr char FIRMWARE_VERSION[] = "rt-gw-1.1";
 
 void stopAudioI2S();
 bool configureMicrophoneI2S();
 bool configureSpeakerI2S();
 void requestPlaybackAudio(size_t slots);
-
-String base64Encode(const uint8_t* data, size_t length) {
-  size_t outputLength = 0;
-  mbedtls_base64_encode(nullptr, 0, &outputLength, data, length);
-
-  std::vector<unsigned char> output(outputLength + 1, 0);
-  int result =
-      mbedtls_base64_encode(output.data(), output.size(), &outputLength, data, length);
-  if (result != 0) {
-    return String();
-  }
-
-  return String(reinterpret_cast<char*>(output.data()));
-}
-
-std::vector<uint8_t> base64Decode(const char* data) {
-  size_t inputLength = strlen(data);
-  size_t outputLength = 0;
-  mbedtls_base64_decode(nullptr, 0, &outputLength,
-                        reinterpret_cast<const unsigned char*>(data), inputLength);
-
-  std::vector<uint8_t> output(outputLength);
-  if (mbedtls_base64_decode(output.data(), output.size(), &outputLength,
-                            reinterpret_cast<const unsigned char*>(data),
-                            inputLength) != 0) {
-    return {};
-  }
-
-  output.resize(outputLength);
-  return output;
-}
+void startWakeListening();
+void startFollowUpListening();
 
 void setState(DeviceState nextState) {
   portENTER_CRITICAL(&stateMux);
@@ -185,6 +167,45 @@ bool dequeueOutbound(String& payload) {
   return hasPayload;
 }
 
+void enqueueOutboundAudio(const int16_t* samples, size_t sampleCount,
+                          bool commandAudio) {
+  std::vector<uint8_t> frame(1 + sampleCount * sizeof(int16_t));
+  frame[0] = commandAudio ? AUDIO_FRAME_COMMAND : AUDIO_FRAME_WAKE;
+  memcpy(frame.data() + 1, samples, sampleCount * sizeof(int16_t));
+
+  portENTER_CRITICAL(&playbackMux);
+  if (outboundAudioQueue.size() >= MAX_OUTBOUND_AUDIO_CHUNKS) {
+    outboundAudioQueue.pop_front();
+  }
+  outboundAudioQueue.emplace_back(std::move(frame));
+  portEXIT_CRITICAL(&playbackMux);
+}
+
+bool dequeueOutboundAudio(std::vector<uint8_t>& frame) {
+  bool hasFrame = false;
+  portENTER_CRITICAL(&playbackMux);
+  if (!outboundAudioQueue.empty()) {
+    frame = std::move(outboundAudioQueue.front());
+    outboundAudioQueue.pop_front();
+    hasFrame = true;
+  }
+  portEXIT_CRITICAL(&playbackMux);
+  return hasFrame;
+}
+
+void clearOutboundAudio() {
+  portENTER_CRITICAL(&playbackMux);
+  outboundAudioQueue.clear();
+  portEXIT_CRITICAL(&playbackMux);
+}
+
+bool hasOutboundAudio() {
+  portENTER_CRITICAL(&playbackMux);
+  const bool hasAudio = !outboundAudioQueue.empty();
+  portEXIT_CRITICAL(&playbackMux);
+  return hasAudio;
+}
+
 void sendCommit() {
   JsonDocument doc;
   doc["type"] = "commit";
@@ -203,17 +224,80 @@ void startListening() {
     return;
   }
 
-  if (!configureMicrophoneI2S()) {
-    setState(DeviceState::Error);
-    refreshLed();
-    return;
+  wakeListening = false;
+  responsePlaybackComplete = false;
+  followUpRequested = false;
+  followUpDeadlineMs = 0;
+  AudioMode currentAudioMode;
+  portENTER_CRITICAL(&audioMux);
+  currentAudioMode = audioMode;
+  portEXIT_CRITICAL(&audioMux);
+  if (currentAudioMode != AudioMode::Microphone) {
+    if (!configureMicrophoneI2S()) {
+      setState(DeviceState::Error);
+      refreshLed();
+      return;
+    }
   }
   listening = true;
+  commandAudioStartsAtMs = 0;
   outboundAudioChunksQueued = 0;
   outboundAudioChunksSent = 0;
   setState(DeviceState::Listening);
   refreshLed();
   Serial.println("[voice] listening started");
+}
+
+void startWakeListening() {
+  if (!wsConnected || listening || wakeListening) {
+    return;
+  }
+
+  AudioMode currentAudioMode;
+  portENTER_CRITICAL(&audioMux);
+  currentAudioMode = audioMode;
+  portEXIT_CRITICAL(&audioMux);
+  if (currentAudioMode != AudioMode::Microphone && !configureMicrophoneI2S()) {
+    setState(DeviceState::Error);
+    refreshLed();
+    return;
+  }
+
+  wakeListening = true;
+  commandAudioStartsAtMs = 0;
+  followUpRequested = false;
+  followUpDeadlineMs = 0;
+  outboundAudioChunksQueued = 0;
+  outboundAudioChunksSent = 0;
+  setState(DeviceState::Idle);
+  refreshLed();
+  Serial.println("[wake] listening for Hey Jarvis");
+}
+
+void startFollowUpListening() {
+  if (!wsConnected || listening || wakeListening) {
+    return;
+  }
+
+  AudioMode currentAudioMode;
+  portENTER_CRITICAL(&audioMux);
+  currentAudioMode = audioMode;
+  portEXIT_CRITICAL(&audioMux);
+  if (currentAudioMode != AudioMode::Microphone && !configureMicrophoneI2S()) {
+    setState(DeviceState::Error);
+    refreshLed();
+    return;
+  }
+
+  listening = true;
+  commandAudioStartsAtMs = 0;
+  followUpDeadlineMs = millis() + followUpTimeoutMs;
+  outboundAudioChunksQueued = 0;
+  outboundAudioChunksSent = 0;
+  setState(DeviceState::Listening);
+  refreshLed();
+  Serial.printf("[follow-up] listening for %lu ms\n",
+                static_cast<unsigned long>(followUpTimeoutMs));
 }
 
 void stopListeningAndCommit() {
@@ -222,6 +306,8 @@ void stopListeningAndCommit() {
   }
 
   listening = false;
+  commandAudioStartsAtMs = 0;
+  followUpDeadlineMs = 0;
   stopAudioI2S();
   sendCommit();
   Serial.println("[voice] listening stopped; commit sent");
@@ -458,28 +544,58 @@ void handleTextMessage(const char* payload) {
   }
 
   const char* type = doc["type"] | "";
-  if (strcmp(type, "conversation.item.input_audio_transcription.completed") == 0) {
-    Serial.printf("[user] %s\n", doc["transcript"] | "");
-    setState(DeviceState::Thinking);
+  if (strcmp(type, "wake_word.detected") == 0) {
+    if (!wakeListening) {
+      return;
+    }
+    wakeListening = false;
+    listening = true;
+    commandAudioStartsAtMs = millis() + WAKE_COMMAND_DELAY_MS;
+    followUpDeadlineMs = 0;
+    responsePlaybackComplete = false;
+    outboundAudioChunksQueued = 0;
+    outboundAudioChunksSent = 0;
+    setState(DeviceState::Listening);
     refreshLed();
+    Serial.printf("[wake] detected: %s\n", doc["name"] | "unknown");
     return;
   }
 
-  if (strcmp(type, "response.output_audio.delta") == 0) {
-    AudioMode currentAudioMode;
-    portENTER_CRITICAL(&audioMux);
-    currentAudioMode = audioMode;
-    portEXIT_CRITICAL(&audioMux);
-    if (currentAudioMode != AudioMode::Speaker) {
-      if (!configureSpeakerI2S()) {
-        setState(DeviceState::Error);
-        refreshLed();
-        return;
-      }
+  if (strcmp(type, "input_audio_buffer.speech_stopped") == 0) {
+    if (listening) {
+      listening = false;
+      commandAudioStartsAtMs = 0;
+      followUpDeadlineMs = 0;
+      stopAudioI2S();
+      setState(DeviceState::Thinking);
+      refreshLed();
+      Serial.println("[voice] speech stopped by server VAD");
     }
-    auto chunk = base64Decode(doc["delta"] | "");
-    enqueuePlayback(std::move(chunk));
-    setState(DeviceState::Playing);
+    return;
+  }
+
+  if (strcmp(type, "input_audio_buffer.speech_started") == 0) {
+    if (listening && followUpDeadlineMs != 0) {
+      followUpDeadlineMs = 0;
+      Serial.println("[follow-up] speech detected");
+    }
+    return;
+  }
+
+  if (strcmp(type, "gateway.playback_complete") == 0) {
+    responsePlaybackComplete = true;
+    followUpRequested = doc["follow_up"] | false;
+    followUpTimeoutMs = std::max(
+        static_cast<uint32_t>(1000),
+        std::min(static_cast<uint32_t>(doc["timeout_ms"] | DEFAULT_FOLLOW_UP_TIMEOUT_MS),
+                 static_cast<uint32_t>(30000)));
+    Serial.println("[playback] gateway delivery complete");
+    return;
+  }
+
+  if (strcmp(type, "conversation.item.input_audio_transcription.completed") == 0) {
+    Serial.printf("[user] %s\n", doc["transcript"] | "");
+    setState(DeviceState::Thinking);
     refreshLed();
     return;
   }
@@ -506,6 +622,10 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
     case WStype_DISCONNECTED:
       wsConnected = false;
       listening = false;
+      wakeListening = false;
+      commandAudioStartsAtMs = 0;
+      followUpRequested = false;
+      followUpDeadlineMs = 0;
       setState(DeviceState::Error);
       refreshLed();
       Serial.println("[ws] disconnected");
@@ -514,14 +634,25 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
     case WStype_CONNECTED:
       wsConnected = true;
       requestPlaybackAudio(PLAYBACK_MAX_BUFFER_CHUNKS);
-      setState(DeviceState::Idle);
-      refreshLed();
       Serial.printf("[ws] connected to %s\n", payload);
+      startWakeListening();
       break;
 
     case WStype_TEXT:
       handleTextMessage(reinterpret_cast<const char*>(payload));
       break;
+
+    case WStype_BIN: {
+      wakeListening = false;
+      listening = false;
+      commandAudioStartsAtMs = 0;
+      followUpDeadlineMs = 0;
+      std::vector<uint8_t> chunk(payload, payload + length);
+      enqueuePlayback(std::move(chunk));
+      setState(DeviceState::Playing);
+      refreshLed();
+      break;
+    }
 
     default:
       break;
@@ -540,7 +671,8 @@ void microphoneTask(void*) {
     currentAudioMode = audioMode;
     portEXIT_CRITICAL(&audioMux);
 
-    if (!wsConnected || !listening || currentAudioMode != AudioMode::Microphone) {
+    if (!wsConnected || (!listening && !wakeListening) ||
+        currentAudioMode != AudioMode::Microphone) {
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
     }
@@ -551,7 +683,8 @@ void microphoneTask(void*) {
     portENTER_CRITICAL(&audioMux);
     currentAudioMode = audioMode;
     portEXIT_CRITICAL(&audioMux);
-    if (!listening || currentAudioMode != AudioMode::Microphone) {
+    if ((!listening && !wakeListening) ||
+        currentAudioMode != AudioMode::Microphone) {
       xSemaphoreGive(audioIoMutex);
       continue;
     }
@@ -605,7 +738,8 @@ void microphoneTask(void*) {
     }
 
     chunkCount++;
-    if (chunkCount <= 3 || chunkCount % 25 == 0) {
+    if ((listening && chunkCount % 25 == 0) ||
+        (!listening && (chunkCount <= 3 || chunkCount % 250 == 0))) {
       Serial.printf(
           "[mic] min=%d max=%d delta=%ld avg_abs=%ld first=%d,%d,%d,%d\n",
           sampleMin, sampleMax, static_cast<long>(deltaSum),
@@ -613,26 +747,22 @@ void microphoneTask(void*) {
           samples[3]);
     }
 
-    const size_t monoBytes = sampleCount * sizeof(int16_t);
-    String audioB64 =
-        base64Encode(reinterpret_cast<const uint8_t*>(samples.data()), monoBytes);
-    if (audioB64.isEmpty()) {
+    if (!listening && !wakeListening) {
       continue;
     }
-
-    JsonDocument doc;
-    doc["type"] = "append_audio";
-    doc["audio"] = audioB64;
-    String payload;
-    serializeJson(doc, payload);
-    outboundAudioChunksQueued++;
-    if (outboundAudioChunksQueued <= 3 || outboundAudioChunksQueued % 25 == 0) {
-      Serial.printf("[mic.send] queued chunk=%lu bytes=%u b64=%u\n",
-                    static_cast<unsigned long>(outboundAudioChunksQueued),
-                    static_cast<unsigned>(monoBytes),
-                    static_cast<unsigned>(audioB64.length()));
+    if (listening && commandAudioStartsAtMs != 0 &&
+        static_cast<int32_t>(millis() - commandAudioStartsAtMs) < 0) {
+      continue;
     }
-    enqueueOutbound(std::move(payload));
+    const bool commandAudio = listening;
+    outboundAudioChunksQueued++;
+    if (commandAudio &&
+        (outboundAudioChunksQueued <= 3 || outboundAudioChunksQueued % 25 == 0)) {
+      Serial.printf("[mic.send] queued binary chunk=%lu bytes=%u\n",
+                    static_cast<unsigned long>(outboundAudioChunksQueued),
+                    static_cast<unsigned>(sampleCount * sizeof(int16_t)));
+    }
+    enqueueOutboundAudio(samples.data(), sampleCount, commandAudio);
   }
 }
 
@@ -657,6 +787,15 @@ void playbackTask(void*) {
       if (playbackPrimed && millis() - lastChunkPlayedMs > PLAYBACK_IDLE_RESET_MS) {
         playbackPrimed = false;
         Serial.println("[playback] buffer drained");
+      }
+      if (responsePlaybackComplete && !playbackPrimed && !listening && wsConnected) {
+        responsePlaybackComplete = false;
+        if (followUpRequested) {
+          followUpRequested = false;
+          startFollowUpListening();
+        } else {
+          startWakeListening();
+        }
       }
       if (!listening && wsConnected && deviceState == DeviceState::Playing) {
         setState(DeviceState::Idle);
@@ -737,6 +876,26 @@ void processButton() {
   }
 }
 
+void processFollowUpTimeout() {
+  if (!listening || followUpDeadlineMs == 0 ||
+      static_cast<int32_t>(millis() - followUpDeadlineMs) < 0) {
+    return;
+  }
+
+  listening = false;
+  followUpDeadlineMs = 0;
+  stopAudioI2S();
+  clearOutboundAudio();
+
+  JsonDocument doc;
+  doc["type"] = "cancel_follow_up";
+  String payload;
+  serializeJson(doc, payload);
+  enqueueOutbound(std::move(payload));
+  Serial.println("[follow-up] timed out; returning to wake word");
+  startWakeListening();
+}
+
 void connectWebSocket() {
   ws.begin(GATEWAY_HOST, GATEWAY_PORT, GATEWAY_PATH);
   ws.onEvent(webSocketEvent);
@@ -777,19 +936,27 @@ void setup() {
 void loop() {
   ws.loop();
 
-  String outbound;
-  int sent = 0;
-  while (wsConnected && sent < 4 && dequeueOutbound(outbound)) {
-    bool isAudioChunk = outbound.indexOf("\"type\":\"append_audio\"") >= 0;
-    ws.sendTXT(outbound);
-    if (isAudioChunk) {
+  std::vector<uint8_t> audioFrame;
+  int audioSent = 0;
+  while (wsConnected && audioSent < 4 && dequeueOutboundAudio(audioFrame)) {
+    ws.sendBIN(audioFrame.data(), audioFrame.size());
+    if (audioFrame[0] == AUDIO_FRAME_COMMAND) {
       outboundAudioChunksSent++;
       if (outboundAudioChunksSent <= 3 || outboundAudioChunksSent % 25 == 0) {
-        Serial.printf("[ws.send] audio chunk=%lu payload=%u\n",
+        Serial.printf("[ws.send] binary audio chunk=%lu payload=%u\n",
                       static_cast<unsigned long>(outboundAudioChunksSent),
-                      static_cast<unsigned>(outbound.length()));
+                      static_cast<unsigned>(audioFrame.size() - 1));
       }
     }
+    audioSent++;
+    delay(1);
+  }
+
+  String outbound;
+  int sent = 0;
+  while (wsConnected && !hasOutboundAudio() && sent < 4 &&
+         dequeueOutbound(outbound)) {
+    ws.sendTXT(outbound);
     sent++;
     delay(1);
   }
@@ -799,5 +966,6 @@ void loop() {
   }
 
   processButton();
+  processFollowUpTimeout();
   delay(5);
 }

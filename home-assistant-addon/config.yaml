@@ -1,5 +1,5 @@
 name: OpenAI Voice Gateway
-version: "0.1.0"
+version: "0.3.1"
 slug: openai_voice_gateway
 description: Realtime OpenAI voice gateway with a browser demo and Home Assistant hooks
 url: https://platform.openai.com/
@@ -29,6 +29,12 @@ options:
   home_assistant_token: ""
   listen_port: 8765
   last_input_pcm_path: /home/hassio/openai-last-input.pcm
+  wake_word_enabled: true
+  wake_word_host: core-openwakeword
+  wake_word_port: 10400
+  wake_word_name: hey_jarvis
+  wake_audio_gain: 8
+  follow_up_timeout_ms: 5000
 schema:
   openai_api_key: password
   openai_model: str
@@ -38,3 +44,9 @@ schema:
   home_assistant_token: password
   listen_port: port
   last_input_pcm_path: str
+  wake_word_enabled: bool
+  wake_word_host: str
+  wake_word_port: port
+  wake_word_name: str
+  wake_audio_gain: int(1,32)
+  follow_up_timeout_ms: int(1000,30000)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import json
 import os
 import struct
@@ -14,6 +15,9 @@ import httpx
 import websockets
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
+from wyoming.audio import AudioChunk, AudioStart
+from wyoming.event import async_read_event, async_write_event
+from wyoming.wake import Detect, Detection
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-realtime-mini")
@@ -32,8 +36,32 @@ AUDIO_DELTA_SLICE_BYTES = 1920
 MAX_PENDING_AUDIO_EVENTS = 6
 MAX_DEVICE_AUDIO_SLOTS = int(os.getenv("MAX_DEVICE_AUDIO_SLOTS", "32"))
 LAST_INPUT_PCM_PATH = os.getenv("LAST_INPUT_PCM_PATH", "/tmp/openai-last-input.pcm")
+WAKE_WORD_ENABLED = os.getenv("WAKE_WORD_ENABLED", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+WAKE_WORD_HOST = os.getenv("WAKE_WORD_HOST", "core-openwakeword")
+WAKE_WORD_PORT = int(os.getenv("WAKE_WORD_PORT", "10400"))
+WAKE_WORD_NAME = os.getenv("WAKE_WORD_NAME", "hey_jarvis")
+WAKE_AUDIO_GAIN = max(1, int(os.getenv("WAKE_AUDIO_GAIN", "8")))
+FOLLOW_UP_TIMEOUT_MS = max(1000, int(os.getenv("FOLLOW_UP_TIMEOUT_MS", "5000")))
 
 HA_TOOL_DEFINITIONS = [
+    {
+        "type": "function",
+        "name": "expect_follow_up",
+        "description": (
+            "Mark that the spoken reply asks the user a real question, requests "
+            "clarification, or requires confirmation and should keep listening."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
     {
         "type": "function",
         "name": "get_entity_state",
@@ -219,6 +247,89 @@ def log(message: str) -> None:
     print(f"[gateway] {message}", flush=True)
 
 
+class WakeWordDetector:
+    def __init__(self) -> None:
+        self.reader: Optional[asyncio.StreamReader] = None
+        self.writer: Optional[asyncio.StreamWriter] = None
+        self.result_task: Optional[asyncio.Task] = None
+        self.retry_after = 0.0
+
+    async def close(self) -> None:
+        if self.result_task is not None:
+            self.result_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.result_task
+            self.result_task = None
+        if self.writer is not None:
+            self.writer.close()
+            with suppress(Exception):
+                await self.writer.wait_closed()
+        self.reader = None
+        self.writer = None
+
+    async def connect(self) -> bool:
+        if self.writer is not None:
+            return True
+        if time.monotonic() < self.retry_after:
+            return False
+
+        try:
+            self.reader, self.writer = await asyncio.open_connection(
+                WAKE_WORD_HOST,
+                WAKE_WORD_PORT,
+            )
+            await async_write_event(
+                Detect(names=[WAKE_WORD_NAME]).event(),
+                self.writer,
+            )
+            await async_write_event(
+                AudioStart(rate=16000, width=2, channels=1).event(),
+                self.writer,
+            )
+            self.result_task = asyncio.create_task(async_read_event(self.reader))
+            log(
+                f"wake word detector armed for {WAKE_WORD_NAME} "
+                f"at {WAKE_WORD_HOST}:{WAKE_WORD_PORT}"
+            )
+            return True
+        except Exception as exc:
+            log(f"wake word detector connection failed: {exc}")
+            self.retry_after = time.monotonic() + 5.0
+            await self.close()
+            return False
+
+    async def feed(self, audio: bytes) -> Optional[str]:
+        if not audio or not await self.connect():
+            return None
+
+        assert self.writer is not None
+        try:
+            await async_write_event(
+                AudioChunk(
+                    rate=16000,
+                    width=2,
+                    channels=1,
+                    audio=audio,
+                ).event(),
+                self.writer,
+            )
+            await asyncio.sleep(0)
+            if self.result_task is None or not self.result_task.done():
+                return None
+
+            event = self.result_task.result()
+            detected_name: Optional[str] = None
+            if event is not None and Detection.is_type(event.type):
+                detected_name = Detection.from_event(event).name or WAKE_WORD_NAME
+            await self.close()
+            return detected_name
+        except Exception as exc:
+            log(f"wake word detector stream failed: {exc}")
+            self.retry_after = time.monotonic() + 2.0
+            await self.close()
+            return None
+
+
 def analyze_pcm16(raw: bytes) -> dict[str, Any]:
     if len(raw) < 2:
         return {
@@ -244,6 +355,23 @@ def analyze_pcm16(raw: bytes) -> dict[str, Any]:
         "zero_ratio": round(zero_count / sample_count, 4),
         "first_samples": list(samples[:16]),
     }
+
+
+def amplify_pcm16(raw: bytes, gain: int) -> bytes:
+    if gain <= 1 or len(raw) < 2:
+        return raw
+    sample_count = len(raw) // 2
+    samples = struct.unpack("<" + "h" * sample_count, raw[: sample_count * 2])
+    amplified = [max(-32768, min(32767, sample * gain)) for sample in samples]
+    return struct.pack("<" + "h" * sample_count, *amplified)
+
+
+def decode_audio_base64(value: Any) -> bytes:
+    try:
+        return base64.b64decode(str(value), validate=True)
+    except (binascii.Error, ValueError) as exc:
+        log(f"ignoring malformed audio chunk: {exc}")
+        return b""
 
 
 async def send_event_to_client(client_ws: WebSocket, event: dict[str, Any]) -> None:
@@ -276,6 +404,14 @@ async def health():
         "model": OPENAI_MODEL,
         "voice": OPENAI_VOICE,
         "ha_url": HOME_ASSISTANT_URL,
+        "wake_word": {
+            "enabled": WAKE_WORD_ENABLED,
+            "name": WAKE_WORD_NAME,
+            "host": WAKE_WORD_HOST,
+            "port": WAKE_WORD_PORT,
+            "audio_gain": WAKE_AUDIO_GAIN,
+        },
+        "follow_up_timeout_ms": FOLLOW_UP_TIMEOUT_MS,
     }
 
 
@@ -331,7 +467,14 @@ async def configure_openai(ws):
                     "type": "realtime",
                     "audio": {
                         "input": {
-                            "turn_detection": None,
+                            "turn_detection": {
+                                "type": "server_vad",
+                                "threshold": 0.5,
+                                "prefix_padding_ms": 300,
+                                "silence_duration_ms": 900,
+                                "create_response": True,
+                                "interrupt_response": False,
+                            },
                         },
                     },
                     "instructions": ASSISTANT_INSTRUCTIONS
@@ -340,6 +483,8 @@ async def configure_openai(ws):
                     + "\n- Use get_entity_state before acting if status matters."
                     + "\n- Use call_home_assistant_service for control actions."
                     + "\n- Ask a short confirmation before ambiguous or impactful actions."
+                    + "\n- Call expect_follow_up before asking a real question, requesting clarification, or asking for confirmation."
+                    + "\n- Do not call expect_follow_up for rhetorical questions or when no user reply is needed."
                     + "\n- Reply in Russian by default."
                     + "\n- Keep spoken replies concise, usually one or two short sentences."
                     + "\n- Avoid long introductions and avoid lists unless the user asks for them.",
@@ -438,11 +583,16 @@ async def relay(client_ws: WebSocket):
             commit_requested = False
             output_audio_chunks = 0
             last_output_audio_delta_at = 0.0
-            pending_audio_events: deque[dict[str, Any]] = deque()
+            pending_audio_events: deque[bytes] = deque()
             client_send_lock = asyncio.Lock()
             device_audio_slots = 0
             gateway_response_id = 0
             gateway_audio_seq = 0
+            response_audio_done = False
+            response_has_audio = False
+            playback_complete_sent = False
+            follow_up_requested = False
+            wake_detector = WakeWordDetector()
 
             await configure_openai(openai_ws)
 
@@ -450,7 +600,8 @@ async def relay(client_ws: WebSocket):
                 slot_count: Optional[int] = None,
                 additive: bool = False,
             ) -> None:
-                nonlocal device_audio_slots
+                nonlocal device_audio_slots, playback_complete_sent
+                nonlocal follow_up_requested
                 async with client_send_lock:
                     if slot_count is not None:
                         if additive:
@@ -466,10 +617,28 @@ async def relay(client_ws: WebSocket):
 
                     sent = 0
                     while device_audio_slots > 0 and pending_audio_events:
-                        event = pending_audio_events.popleft()
-                        await client_ws.send_text(json.dumps(event))
+                        audio_chunk = pending_audio_events.popleft()
+                        await client_ws.send_bytes(audio_chunk)
                         device_audio_slots -= 1
                         sent += 1
+
+                    if (
+                        response_audio_done
+                        and not pending_audio_events
+                        and not playback_complete_sent
+                    ):
+                        await client_ws.send_text(
+                            json.dumps(
+                                {
+                                    "type": "gateway.playback_complete",
+                                    "follow_up": follow_up_requested,
+                                    "timeout_ms": FOLLOW_UP_TIMEOUT_MS,
+                                }
+                            )
+                        )
+                        playback_complete_sent = True
+                        follow_up_requested = False
+                        log("all response audio delivered to device")
 
                 if sent:
                     log(
@@ -503,30 +672,87 @@ async def relay(client_ws: WebSocket):
             async def client_to_openai():
                 nonlocal audio_chunks, buffered_audio, raw_turn_audio
                 nonlocal sent_audio_bytes, commit_requested
+                nonlocal follow_up_requested
                 try:
                     while True:
                         message = await client_ws.receive()
-                        if message.get("text") is None:
+                        binary_message = message.get("bytes")
+                        if binary_message is not None:
+                            if len(binary_message) < 2:
+                                continue
+                            frame_type = binary_message[0]
+                            audio_data = binary_message[1:]
+                            if frame_type == 1:
+                                payload = {
+                                    "type": "append_audio",
+                                    "audio_bytes": audio_data,
+                                }
+                            elif frame_type == 0:
+                                payload = {
+                                    "type": "wake_audio",
+                                    "audio_bytes": audio_data,
+                                }
+                            else:
+                                log(f"ignoring unknown binary frame type: {frame_type}")
+                                continue
+                        elif message.get("text") is None:
                             continue
-                        payload = json.loads(message["text"])
+                        else:
+                            try:
+                                payload = json.loads(message["text"])
+                            except json.JSONDecodeError as exc:
+                                log(f"ignoring malformed client message: {exc}")
+                                continue
                         kind = payload.get("type")
                         if not openai_ready.is_set():
                             await openai_ready.wait()
                         if kind == "append_audio":
                             if audio_chunks == 0 and sent_audio_bytes == 0 and not buffered_audio:
+                                follow_up_requested = False
                                 await openai_ws.send(
                                     json.dumps({"type": "input_audio_buffer.clear"})
                                 )
                             audio_chunks += 1
-                            audio_b64 = str(payload.get("audio", ""))
-                            if audio_b64:
-                                decoded = base64.b64decode(audio_b64)
+                            decoded = payload.get("audio_bytes")
+                            if decoded is None:
+                                audio_b64 = str(payload.get("audio", ""))
+                                decoded = decode_audio_base64(audio_b64)
+                            if decoded:
                                 buffered_audio.extend(decoded)
                                 raw_turn_audio.extend(decoded)
                             if audio_chunks % 25 == 0:
                                 log(f"received {audio_chunks} audio chunks from {client_host}")
                             if len(buffered_audio) >= 8192:
                                 await flush_buffered_audio()
+                        elif kind == "wake_audio":
+                            if not WAKE_WORD_ENABLED:
+                                continue
+                            wake_audio = payload.get("audio_bytes")
+                            if wake_audio is None:
+                                audio_b64 = str(payload.get("audio", ""))
+                                wake_audio = decode_audio_base64(audio_b64)
+                            if not wake_audio:
+                                continue
+                            detected_name = await wake_detector.feed(
+                                amplify_pcm16(
+                                    wake_audio,
+                                    WAKE_AUDIO_GAIN,
+                                )
+                            )
+                            if detected_name:
+                                log(
+                                    f"wake word detected for {client_host}: "
+                                    f"{detected_name}"
+                                )
+                                async with client_send_lock:
+                                    await client_ws.send_text(
+                                        json.dumps(
+                                            {
+                                                "type": "wake_word.detected",
+                                                "name": detected_name,
+                                            }
+                                        )
+                                    )
                         elif kind == "commit":
                             log(f"commit received from {client_host} after {audio_chunks} audio chunks")
                             await flush_buffered_audio()
@@ -549,6 +775,16 @@ async def relay(client_ws: WebSocket):
                             sent_audio_bytes = 0
                             raw_turn_audio.clear()
                             audio_chunks = 0
+                        elif kind == "cancel_follow_up":
+                            buffered_audio.clear()
+                            raw_turn_audio.clear()
+                            sent_audio_bytes = 0
+                            audio_chunks = 0
+                            commit_requested = False
+                            await openai_ws.send(
+                                json.dumps({"type": "input_audio_buffer.clear"})
+                            )
+                            log(f"follow-up window expired for {client_host}")
                         elif kind == "audio_request":
                             free_slots = int(payload.get("slots", 0) or 0)
                             requested_slots = max(0, free_slots)
@@ -569,10 +805,16 @@ async def relay(client_ws: WebSocket):
                             await openai_ws.send(json.dumps(payload))
                 except (WebSocketDisconnect, RuntimeError):
                     pass
+                finally:
+                    await wake_detector.close()
 
             async def openai_to_client():
                 nonlocal commit_requested, output_audio_chunks, last_output_audio_delta_at
                 nonlocal gateway_response_id, gateway_audio_seq
+                nonlocal audio_chunks, buffered_audio, raw_turn_audio, sent_audio_bytes
+                nonlocal response_audio_done, playback_complete_sent
+                nonlocal response_has_audio
+                nonlocal follow_up_requested
                 async for message in openai_ws:
                     event = json.loads(message)
                     event_type = event.get("type", "unknown")
@@ -603,6 +845,9 @@ async def relay(client_ws: WebSocket):
                     if event_type == "response.created":
                         gateway_response_id += 1
                         gateway_audio_seq = 0
+                        response_audio_done = False
+                        response_has_audio = False
+                        playback_complete_sent = False
                         if pending_audio_events:
                             log(
                                 "dropping unsent audio from previous response: "
@@ -618,14 +863,18 @@ async def relay(client_ws: WebSocket):
                             tool_name = str(event.get("name", ""))
                             call_id = str(event.get("call_id", ""))
                             log(f"running HA tool: {tool_name}")
-                            try:
-                                arguments = json.loads(event.get("arguments") or "{}")
-                            except json.JSONDecodeError:
-                                arguments = {}
-                            try:
-                                tool_result = await run_tool(tool_name, arguments)
-                            except HTTPException as exc:
-                                tool_result = {"ok": False, "error": exc.detail}
+                            if tool_name == "expect_follow_up":
+                                follow_up_requested = True
+                                tool_result = {"ok": True, "follow_up": True}
+                            else:
+                                try:
+                                    arguments = json.loads(event.get("arguments") or "{}")
+                                except json.JSONDecodeError:
+                                    arguments = {}
+                                try:
+                                    tool_result = await run_tool(tool_name, arguments)
+                                except HTTPException as exc:
+                                    tool_result = {"ok": False, "error": exc.detail}
                             await openai_ws.send(
                                 json.dumps(
                                     {
@@ -646,6 +895,17 @@ async def relay(client_ws: WebSocket):
                         last_output_audio_delta_at = 0.0
                         pending_audio_events.clear()
                         await openai_ws.send(json.dumps({"type": "response.create"}))
+                    elif event_type == "input_audio_buffer.committed":
+                        if raw_turn_audio:
+                            stats = analyze_pcm16(bytes(raw_turn_audio))
+                            log(
+                                "VAD committed turn audio: "
+                                + json.dumps(stats, ensure_ascii=True)
+                            )
+                        buffered_audio.clear()
+                        raw_turn_audio.clear()
+                        sent_audio_bytes = 0
+                        audio_chunks = 0
                     if (
                         event_type == "error"
                         and event.get("error", {}).get("code") == "input_audio_buffer_commit_empty"
@@ -654,7 +914,10 @@ async def relay(client_ws: WebSocket):
                     if event_type == "response.done":
                         output_audio_chunks = 0
                         last_output_audio_delta_at = 0.0
+                        if response_has_audio:
+                            response_audio_done = True
                     if event_type == "response.output_audio.delta":
+                        response_has_audio = True
                         delta = event.get("delta")
                         if isinstance(delta, str):
                             raw = base64.b64decode(delta)
@@ -662,22 +925,22 @@ async def relay(client_ws: WebSocket):
                                 log(f"splitting audio delta of {len(raw)} bytes")
                             for start in range(0, len(raw), AUDIO_DELTA_SLICE_BYTES):
                                 pending_audio_events.append(
-                                    {
-                                        **event,
-                                        "response_id": gateway_response_id,
-                                        "audio_seq": gateway_audio_seq,
-                                        "delta": base64.b64encode(
-                                            raw[start:start + AUDIO_DELTA_SLICE_BYTES]
-                                        ).decode("ascii"),
-                                    }
+                                    raw[start:start + AUDIO_DELTA_SLICE_BYTES]
                                 )
                                 gateway_audio_seq += 1
                             await send_requested_audio()
                             continue
+                    if event_type == "response.output_audio_transcript.done":
+                        transcript = str(event.get("transcript", "")).strip()
+                        if transcript.endswith("?"):
+                            follow_up_requested = True
+                            log("follow-up enabled by assistant question")
                     if event_type == "error":
                         log(f"OpenAI error payload: {json.dumps(event)}")
                     async with client_send_lock:
                         await send_event_to_client(client_ws, event)
+                    if event_type == "response.done" and response_has_audio:
+                        await send_requested_audio()
 
             tasks = [
                 asyncio.create_task(client_to_openai()),

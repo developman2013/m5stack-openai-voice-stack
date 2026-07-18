@@ -21,6 +21,26 @@ This add-on exposes a local WebSocket gateway for the M5Stack firmware and bridg
 - `home_assistant_token`
 - `listen_port`
 - `last_input_pcm_path`
+- `wake_word_enabled`
+- `wake_word_host`
+- `wake_word_port`
+- `wake_word_name`
+- `wake_audio_gain`
+- `follow_up_timeout_ms`
+
+## Wake word
+
+The default wake word is `Hey Jarvis`. In Home Assistant OS, install and start
+the official openWakeWord app before enabling wake-word mode. The gateway uses
+the Wyoming endpoint at `core-openwakeword:10400` by default.
+
+The M5Stack streams 16 kHz PCM audio to the gateway while idle. Wake-word audio
+is processed locally and is not forwarded to OpenAI. The device button remains
+available as a fallback push-to-talk control.
+
+When the assistant asks a real question or requests confirmation, the device
+opens a short follow-up window after playback. The default timeout is 5 seconds;
+if no speech is detected, it returns to wake-word mode.
 
 If `home_assistant_token` is empty and the add-on runs inside Home Assistant, it can fall back to `SUPERVISOR_TOKEN`.
 
