@@ -3,6 +3,8 @@
 #include <WebSocketsClient.h>
 #include <WiFi.h>
 #include <driver/i2s.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <mbedtls/base64.h>
 
 #include <Adafruit_NeoPixel.h>
@@ -64,6 +66,7 @@ Adafruit_NeoPixel led(1, PIN_LED, NEO_GRB + NEO_KHZ800);
 portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE playbackMux = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE audioMux = portMUX_INITIALIZER_UNLOCKED;
+SemaphoreHandle_t audioIoMutex = nullptr;
 
 DeviceState deviceState = DeviceState::Booting;
 bool wsConnected = false;
@@ -77,11 +80,11 @@ uint32_t outboundAudioChunksSent = 0;
 std::deque<std::vector<uint8_t>> playbackQueue;
 std::deque<String> outboundQueue;
 
-constexpr char FIRMWARE_VERSION[] = "rt-gw-0.6";
+constexpr char FIRMWARE_VERSION[] = "rt-gw-0.7";
 
 void stopAudioI2S();
-void configureMicrophoneI2S();
-void configureSpeakerI2S();
+bool configureMicrophoneI2S();
+bool configureSpeakerI2S();
 void requestPlaybackAudio(size_t slots);
 
 String base64Encode(const uint8_t* data, size_t length) {
@@ -200,7 +203,11 @@ void startListening() {
     return;
   }
 
-  configureMicrophoneI2S();
+  if (!configureMicrophoneI2S()) {
+    setState(DeviceState::Error);
+    refreshLed();
+    return;
+  }
   listening = true;
   outboundAudioChunksQueued = 0;
   outboundAudioChunksSent = 0;
@@ -276,7 +283,7 @@ bool dequeuePlayback(std::vector<uint8_t>& chunk) {
   return hasChunk;
 }
 
-void stopAudioI2S() {
+bool stopAudioI2SLocked() {
   bool shouldUninstall = false;
   portENTER_CRITICAL(&audioMux);
   shouldUninstall = audioMode != AudioMode::None;
@@ -284,12 +291,39 @@ void stopAudioI2S() {
   portEXIT_CRITICAL(&audioMux);
 
   if (shouldUninstall) {
-    i2s_driver_uninstall(I2S_PORT_AUDIO);
+    const esp_err_t err = i2s_driver_uninstall(I2S_PORT_AUDIO);
+    if (err != ESP_OK) {
+      Serial.printf("[audio] uninstall failed: %d\n", static_cast<int>(err));
+      return false;
+    }
   }
+  return true;
 }
 
-void configureMicrophoneI2S() {
-  stopAudioI2S();
+void stopAudioI2S() {
+  if (audioIoMutex == nullptr ||
+      xSemaphoreTake(audioIoMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+    Serial.println("[audio] timed out waiting to stop I2S");
+    return;
+  }
+  if (!stopAudioI2SLocked()) {
+    xSemaphoreGive(audioIoMutex);
+    return;
+  }
+  xSemaphoreGive(audioIoMutex);
+}
+
+bool configureMicrophoneI2S() {
+  if (audioIoMutex == nullptr ||
+      xSemaphoreTake(audioIoMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+    Serial.println("[audio] timed out waiting for microphone I2S");
+    return false;
+  }
+
+  if (!stopAudioI2SLocked()) {
+    xSemaphoreGive(audioIoMutex);
+    return false;
+  }
 
   const i2s_config_t config = {
       .mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM),
@@ -314,17 +348,37 @@ void configureMicrophoneI2S() {
   pins.data_out_num = I2S_PIN_NO_CHANGE;
   pins.data_in_num = PIN_MIC_DIN;
 
-  i2s_driver_install(I2S_PORT_AUDIO, &config, 0, nullptr);
-  i2s_set_pin(I2S_PORT_AUDIO, &pins);
-  i2s_zero_dma_buffer(I2S_PORT_AUDIO);
-  portENTER_CRITICAL(&audioMux);
-  audioMode = AudioMode::Microphone;
-  portEXIT_CRITICAL(&audioMux);
+  esp_err_t err = i2s_driver_install(I2S_PORT_AUDIO, &config, 0, nullptr);
+  if (err == ESP_OK) err = i2s_set_pin(I2S_PORT_AUDIO, &pins);
+  if (err == ESP_OK) err = i2s_zero_dma_buffer(I2S_PORT_AUDIO);
+  if (err == ESP_OK) {
+    portENTER_CRITICAL(&audioMux);
+    audioMode = AudioMode::Microphone;
+    portEXIT_CRITICAL(&audioMux);
+  } else {
+    i2s_driver_uninstall(I2S_PORT_AUDIO);
+  }
+  xSemaphoreGive(audioIoMutex);
+
+  if (err != ESP_OK) {
+    Serial.printf("[audio] microphone setup failed: %d\n", static_cast<int>(err));
+    return false;
+  }
   Serial.println("[audio] configured microphone");
+  return true;
 }
 
-void configureSpeakerI2S() {
-  stopAudioI2S();
+bool configureSpeakerI2S() {
+  if (audioIoMutex == nullptr ||
+      xSemaphoreTake(audioIoMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+    Serial.println("[audio] timed out waiting for speaker I2S");
+    return false;
+  }
+
+  if (!stopAudioI2SLocked()) {
+    xSemaphoreGive(audioIoMutex);
+    return false;
+  }
 
   const i2s_config_t config = {
       .mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_TX),
@@ -349,13 +403,24 @@ void configureSpeakerI2S() {
   pins.data_out_num = PIN_SPK_DOUT;
   pins.data_in_num = I2S_PIN_NO_CHANGE;
 
-  i2s_driver_install(I2S_PORT_AUDIO, &config, 0, nullptr);
-  i2s_set_pin(I2S_PORT_AUDIO, &pins);
-  i2s_zero_dma_buffer(I2S_PORT_AUDIO);
-  portENTER_CRITICAL(&audioMux);
-  audioMode = AudioMode::Speaker;
-  portEXIT_CRITICAL(&audioMux);
+  esp_err_t err = i2s_driver_install(I2S_PORT_AUDIO, &config, 0, nullptr);
+  if (err == ESP_OK) err = i2s_set_pin(I2S_PORT_AUDIO, &pins);
+  if (err == ESP_OK) err = i2s_zero_dma_buffer(I2S_PORT_AUDIO);
+  if (err == ESP_OK) {
+    portENTER_CRITICAL(&audioMux);
+    audioMode = AudioMode::Speaker;
+    portEXIT_CRITICAL(&audioMux);
+  } else {
+    i2s_driver_uninstall(I2S_PORT_AUDIO);
+  }
+  xSemaphoreGive(audioIoMutex);
+
+  if (err != ESP_OK) {
+    Serial.printf("[audio] speaker setup failed: %d\n", static_cast<int>(err));
+    return false;
+  }
   Serial.println("[audio] configured speaker");
+  return true;
 }
 
 void connectWiFi() {
@@ -406,7 +471,11 @@ void handleTextMessage(const char* payload) {
     currentAudioMode = audioMode;
     portEXIT_CRITICAL(&audioMux);
     if (currentAudioMode != AudioMode::Speaker) {
-      configureSpeakerI2S();
+      if (!configureSpeakerI2S()) {
+        setState(DeviceState::Error);
+        refreshLed();
+        return;
+      }
     }
     auto chunk = base64Decode(doc["delta"] | "");
     enqueuePlayback(std::move(chunk));
@@ -476,10 +545,25 @@ void microphoneTask(void*) {
       continue;
     }
 
+    if (xSemaphoreTake(audioIoMutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+      continue;
+    }
+    portENTER_CRITICAL(&audioMux);
+    currentAudioMode = audioMode;
+    portEXIT_CRITICAL(&audioMux);
+    if (!listening || currentAudioMode != AudioMode::Microphone) {
+      xSemaphoreGive(audioIoMutex);
+      continue;
+    }
+
     size_t bytesRead = 0;
     esp_err_t err = i2s_read(I2S_PORT_AUDIO, samples.data(),
                              samples.size() * sizeof(int16_t), &bytesRead,
-                             portMAX_DELAY);
+                             pdMS_TO_TICKS(100));
+    xSemaphoreGive(audioIoMutex);
+    if (err == ESP_ERR_TIMEOUT) {
+      continue;
+    }
     if (err != ESP_OK || bytesRead == 0) {
       readErrorCount++;
       if (readErrorCount <= 10 || readErrorCount % 25 == 0) {
@@ -587,7 +671,10 @@ void playbackTask(void*) {
     currentAudioMode = audioMode;
     portEXIT_CRITICAL(&audioMux);
     if (currentAudioMode != AudioMode::Speaker) {
-      configureSpeakerI2S();
+      if (!configureSpeakerI2S()) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        continue;
+      }
     }
 
     if (!playbackPrimed) {
@@ -608,10 +695,24 @@ void playbackTask(void*) {
       stereoSamples.push_back(mono[i]);
     }
 
+    if (xSemaphoreTake(audioIoMutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+      continue;
+    }
+    portENTER_CRITICAL(&audioMux);
+    currentAudioMode = audioMode;
+    portEXIT_CRITICAL(&audioMux);
     size_t bytesWritten = 0;
-    i2s_write(I2S_PORT_AUDIO, stereoSamples.data(),
-              stereoSamples.size() * sizeof(int16_t), &bytesWritten,
-              portMAX_DELAY);
+    esp_err_t err = ESP_ERR_INVALID_STATE;
+    if (currentAudioMode == AudioMode::Speaker) {
+      err = i2s_write(I2S_PORT_AUDIO, stereoSamples.data(),
+                      stereoSamples.size() * sizeof(int16_t), &bytesWritten,
+                      pdMS_TO_TICKS(200));
+    }
+    xSemaphoreGive(audioIoMutex);
+    if (err != ESP_OK) {
+      Serial.printf("[playback.write] err=%d bytes=%u\n", static_cast<int>(err),
+                    static_cast<unsigned>(bytesWritten));
+    }
     lastChunkPlayedMs = millis();
   }
 }
@@ -653,11 +754,18 @@ void setup() {
   led.clear();
   led.show();
 
+  audioIoMutex = xSemaphoreCreateMutex();
+  if (audioIoMutex == nullptr) {
+    Serial.println("[audio] failed to create I2S mutex");
+    setState(DeviceState::Error);
+    refreshLed();
+    return;
+  }
+
   setState(DeviceState::Booting);
   refreshLed();
 
   setupButton();
-  configureMicrophoneI2S();
   stopAudioI2S();
   connectWiFi();
   connectWebSocket();
