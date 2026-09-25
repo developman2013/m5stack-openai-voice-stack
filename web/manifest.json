@@ -4,9 +4,9 @@
   "builds": [{
     "chipFamily": "ESP32",
     "parts": [
-      {"path": "https://github.com/developman2013/m5stack-openai-voice-stack/releases/latest/download/bootloader.bin", "offset": 4096},
-      {"path": "https://github.com/developman2013/m5stack-openai-voice-stack/releases/latest/download/partitions.bin", "offset": 32768},
-      {"path": "https://github.com/developman2013/m5stack-openai-voice-stack/releases/latest/download/firmware.bin", "offset": 65536}
+      {"path": "./assets/bootloader.bin", "offset": 4096},
+      {"path": "./assets/partitions.bin", "offset": 32768},
+      {"path": "./assets/firmware.bin", "offset": 65536}
     ]
   }]
 }
