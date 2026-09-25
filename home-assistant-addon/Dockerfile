@@ -16,4 +16,4 @@ RUN chmod +x /run.sh
 CMD ["/run.sh"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD-SHELL python3 -c "import os, urllib.request; p=os.getenv('LISTEN_PORT','8765'); urllib.request.urlopen('http://127.0.0.1:'+p+'/health', timeout=3)" || exit 1
+  CMD ["python3", "-c", "import os, urllib.request; p=os.getenv('LISTEN_PORT','8765'); urllib.request.urlopen('http://127.0.0.1:'+p+'/health', timeout=3)"]
