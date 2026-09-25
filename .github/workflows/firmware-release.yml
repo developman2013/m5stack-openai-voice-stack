@@ -33,13 +33,3 @@ jobs:
           files: |
             dist/m5stack-atom-echo.bin
             dist/manifest.json
-      - name: Mirror installer assets to public repository
-        if: ${{ secrets.INSTALLER_REPO_TOKEN != '' && startsWith(github.ref, 'refs/tags/') }}
-        env:
-          GH_TOKEN: ${{ secrets.INSTALLER_REPO_TOKEN }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          gh release create "$RELEASE_TAG" dist/m5stack-atom-echo.bin dist/manifest.json \
-            --repo developman2013/m5stack-openai-voice-installer \
-            --title "M5Stack firmware $RELEASE_TAG" \
-            --notes "Firmware release mirrored from the private source repository."
