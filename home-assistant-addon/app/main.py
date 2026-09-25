@@ -11,10 +11,12 @@ from contextlib import suppress
 from collections import deque
 from typing import Any, Optional
 
-import httpx
+from .audio import MicrophoneResampler
+from .ha_mcp import HomeAssistantMcpClient
+
 import websockets
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 from wyoming.audio import AudioChunk, AudioStart
 from wyoming.event import async_read_event, async_write_event
 from wyoming.wake import Detect, Detection
@@ -30,10 +32,16 @@ ASSISTANT_INSTRUCTIONS = os.getenv(
 )
 HOME_ASSISTANT_URL = os.getenv("HOME_ASSISTANT_URL", "http://supervisor/core")
 HOME_ASSISTANT_TOKEN = os.getenv("HOME_ASSISTANT_TOKEN", "")
+HA_MCP_URL = os.getenv("HA_MCP_URL", f"{HOME_ASSISTANT_URL.rstrip('/')}/api/mcp")
+HA_MCP_ENABLED = os.getenv("HA_MCP_ENABLED", "true").lower() == "true"
+GATEWAY_TOKEN = os.getenv("GATEWAY_TOKEN", "")
 LISTEN_PORT = int(os.getenv("LISTEN_PORT", "8765"))
 REALTIME_URL = f"wss://api.openai.com/v1/realtime?model={OPENAI_MODEL}"
 AUDIO_DELTA_SLICE_BYTES = 1920
-MAX_PENDING_AUDIO_EVENTS = 6
+# Thirty seconds of 24 kHz mono PCM. Fail closed if playback stops draining.
+MAX_AUDIO_BACKLOG_BYTES = 24000 * 2 * 30
+SESSION_IDLE_SECONDS = int(os.getenv("SESSION_IDLE_SECONDS", "120"))
+CONTINUOUS_CONVERSATION = os.getenv("CONTINUOUS_CONVERSATION", "true").lower() == "true"
 MAX_DEVICE_AUDIO_SLOTS = int(os.getenv("MAX_DEVICE_AUDIO_SLOTS", "32"))
 LAST_INPUT_PCM_PATH = os.getenv("LAST_INPUT_PCM_PATH", "/tmp/openai-last-input.pcm")
 WAKE_WORD_ENABLED = os.getenv("WAKE_WORD_ENABLED", "true").lower() in {
@@ -62,73 +70,21 @@ HA_TOOL_DEFINITIONS = [
             "additionalProperties": False,
         },
     },
-    {
-        "type": "function",
-        "name": "get_entity_state",
-        "description": "Read the current state and attributes of a Home Assistant entity.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "entity_id": {
-                    "type": "string",
-                    "description": "Full Home Assistant entity id, for example light.kitchen.",
-                }
-            },
-            "required": ["entity_id"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "type": "function",
-        "name": "search_entities",
-        "description": "Search Home Assistant entities by a loose text query.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Human description such as 'kitchen light' or 'bedroom speaker'.",
-                },
-                "domain": {
-                    "type": "string",
-                    "description": "Optional domain filter such as light, switch, climate, media_player.",
-                },
-            },
-            "required": ["query"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "type": "function",
-        "name": "call_home_assistant_service",
-        "description": "Call a Home Assistant service to control the home.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "domain": {
-                    "type": "string",
-                    "description": "Service domain such as light, switch, media_player, climate, cover.",
-                },
-                "service": {
-                    "type": "string",
-                    "description": "Service name such as turn_on, turn_off, set_temperature, play_media.",
-                },
-                "entity_id": {
-                    "type": ["string", "array"],
-                    "description": "Optional target entity id or list of entity ids.",
-                    "items": {"type": "string"},
-                },
-                "data": {
-                    "type": "object",
-                    "description": "Optional service data payload.",
-                    "additionalProperties": True,
-                },
-            },
-            "required": ["domain", "service"],
-            "additionalProperties": False,
-        },
-    },
+
 ]
+
+# The ESP32 WebSockets client has a small inbound-message limit. Realtime
+# session and response metadata can contain every MCP schema and exceed it.
+# Only these compact control events are useful to the firmware; response audio
+# is delivered separately as bounded binary chunks.
+DEVICE_EVENT_TYPES = {
+    "input_audio_buffer.speech_started",
+    "input_audio_buffer.speech_stopped",
+    "conversation.item.input_audio_transcription.completed",
+    "response.output_audio_transcript.delta",
+    "response.output_audio_transcript.done",
+    "error",
+}
 
 app = FastAPI(title="OpenAI Voice Gateway")
 
@@ -198,6 +154,8 @@ PAGE = """<!doctype html>
         ws.onerror = reject;
       });
 
+      ws.send(JSON.stringify({ type: "auth", token: window.prompt("Gateway token") || "" }));
+      ws.send(JSON.stringify({ type: "begin" }));
       playbackCursor = 0;
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       inputCtx = new AudioContext({ sampleRate: 24000 });
@@ -415,49 +373,12 @@ async def health():
     }
 
 
-def ha_headers() -> dict[str, str]:
-    if not HOME_ASSISTANT_TOKEN:
-        raise HTTPException(status_code=400, detail="home_assistant_token is empty")
-    return {
-        "Authorization": f"Bearer {HOME_ASSISTANT_TOKEN}",
-        "Content-Type": "application/json",
-    }
-
-
-async def ha_get(path: str) -> tuple[int, Any]:
-    url = f"{HOME_ASSISTANT_URL}{path}"
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.get(url, headers=ha_headers())
-    try:
-        body: Any = response.json()
-    except Exception:
-        body = {"text": response.text}
-    return response.status_code, body
-
-
-async def ha_post(path: str, payload: Optional[dict] = None) -> tuple[int, Any]:
-    url = f"{HOME_ASSISTANT_URL}{path}"
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.post(url, headers=ha_headers(), json=payload or {})
-    try:
-        body: Any = response.json()
-    except Exception:
-        body = {"text": response.text}
-    return response.status_code, body
-
-
-@app.post("/ha/service/{domain}/{service}")
-async def call_ha_service(domain: str, service: str, payload: Optional[dict] = None):
-    status_code, body = await ha_post(f"/api/services/{domain}/{service}", payload)
-    return JSONResponse(status_code=status_code, content=body)
-
-
 @app.get("/")
 async def index():
     return HTMLResponse(PAGE)
 
 
-async def configure_openai(ws):
+async def configure_openai(ws, tools=None, tool_prompt=""):
     log(f"configuring OpenAI realtime session for model={OPENAI_MODEL} voice={OPENAI_VOICE}")
     await ws.send(
         json.dumps(
@@ -465,30 +386,29 @@ async def configure_openai(ws):
                 "type": "session.update",
                 "session": {
                     "type": "realtime",
+                    "output_modalities": ["audio"],
                     "audio": {
+                        "output": {
+                            "format": {"type": "audio/pcm", "rate": 24000},
+                            "voice": OPENAI_VOICE,
+                        },
                         "input": {
-                            "turn_detection": {
-                                "type": "server_vad",
-                                "threshold": 0.5,
-                                "prefix_padding_ms": 300,
-                                "silence_duration_ms": 900,
-                                "create_response": True,
-                                "interrupt_response": False,
-                            },
+                            "format": {"type": "audio/pcm", "rate": 24000},
+                            # The first turn is push-to-talk. The Realtime API
+                            # requires VAD to be disabled for a manual commit.
+                            "turn_detection": None,
                         },
                     },
-                    "instructions": ASSISTANT_INSTRUCTIONS
+                    "instructions": ASSISTANT_INSTRUCTIONS + "\n" + tool_prompt
                     + "\n\nYou can use Home Assistant tools during the conversation."
-                    + "\n- Use search_entities if you do not know the exact entity id."
-                    + "\n- Use get_entity_state before acting if status matters."
-                    + "\n- Use call_home_assistant_service for control actions."
+                    + "\n- Use the provided Home Assistant tools for home state and control."
                     + "\n- Ask a short confirmation before ambiguous or impactful actions."
                     + "\n- Call expect_follow_up before asking a real question, requesting clarification, or asking for confirmation."
                     + "\n- Do not call expect_follow_up for rhetorical questions or when no user reply is needed."
                     + "\n- Reply in Russian by default."
                     + "\n- Keep spoken replies concise, usually one or two short sentences."
                     + "\n- Avoid long introductions and avoid lists unless the user asks for them.",
-                    "tools": HA_TOOL_DEFINITIONS,
+                    "tools": HA_TOOL_DEFINITIONS + (tools or []),
                     "tool_choice": "auto",
                 },
             }
@@ -496,85 +416,80 @@ async def configure_openai(ws):
     )
 
 
-async def run_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    if name == "get_entity_state":
-        entity_id = str(arguments["entity_id"])
-        status_code, body = await ha_get(f"/api/states/{entity_id}")
-        return {
-            "ok": 200 <= status_code < 300,
-            "status_code": status_code,
-            "result": body,
-        }
-
-    if name == "search_entities":
-        query = str(arguments["query"]).strip().lower()
-        domain = str(arguments.get("domain", "")).strip().lower()
-        status_code, body = await ha_get("/api/states")
-        if not (200 <= status_code < 300) or not isinstance(body, list):
-            return {"ok": False, "status_code": status_code, "error": body}
-
-        query_parts = [part for part in query.replace("_", " ").split() if part]
-        matches: list[dict[str, Any]] = []
-        for item in body:
-            if not isinstance(item, dict):
-                continue
-            entity_id = str(item.get("entity_id", ""))
-            if domain and not entity_id.startswith(f"{domain}."):
-                continue
-            friendly_name = str(item.get("attributes", {}).get("friendly_name", ""))
-            haystack = f"{entity_id} {friendly_name}".lower().replace("_", " ")
-            if all(part in haystack for part in query_parts):
-                matches.append(
-                    {
-                        "entity_id": entity_id,
-                        "friendly_name": friendly_name,
-                        "state": item.get("state"),
-                    }
-                )
-        return {"ok": True, "count": len(matches), "matches": matches[:15]}
-
-    if name == "call_home_assistant_service":
-        domain = str(arguments["domain"])
-        service = str(arguments["service"])
-        payload = dict(arguments.get("data") or {})
-        entity_id = arguments.get("entity_id")
-        if entity_id is not None:
-            payload["entity_id"] = entity_id
-        status_code, body = await ha_post(f"/api/services/{domain}/{service}", payload)
-        return {
-            "ok": 200 <= status_code < 300,
-            "status_code": status_code,
-            "result": body,
-        }
-
-    return {"ok": False, "error": f"Unknown tool: {name}"}
-
-
 @app.websocket("/ws")
 async def relay(client_ws: WebSocket):
+    await client_ws.accept()
+    authorized = bool(GATEWAY_TOKEN) and client_ws.headers.get("authorization") == f"Bearer {GATEWAY_TOKEN}"
+    if not authorized:
+        try:
+            auth = await asyncio.wait_for(client_ws.receive_json(), timeout=5)
+            import secrets
+            authorized = bool(GATEWAY_TOKEN) and auth.get("type") == "auth" and secrets.compare_digest(str(auth.get("token", "")), GATEWAY_TOKEN)
+        except Exception:
+            authorized = False
+    if not authorized:
+        await client_ws.close(code=1008)
+        return
     if not OPENAI_API_KEY:
-        await client_ws.accept()
         await client_ws.send_json(
             {"type": "error", "message": "openai_api_key is empty"}
         )
         await client_ws.close()
         return
 
-    await client_ws.accept()
     client_host = getattr(client_ws.client, "host", "unknown")
     log(f"client connected from {client_host}")
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
     }
 
+    ha_mcp = None
+    idle_detector = WakeWordDetector()
+    initial_message = None
+    initial_slots = 0
+    last_activity = time.monotonic()
     try:
+        # Idle microphone data stays local. No OpenAI session until activation.
+        while True:
+            message = await client_ws.receive()
+            if message.get("type") == "websocket.disconnect":
+                return
+            binary = message.get("bytes")
+            if binary:
+                if binary[0] == 1:
+                    initial_message = message
+                    break
+                if binary[0] == 0 and WAKE_WORD_ENABLED:
+                    detected = await idle_detector.feed(amplify_pcm16(binary[1:], WAKE_AUDIO_GAIN))
+                    if detected:
+                        await client_ws.send_json({"type": "wake_word.detected", "name": detected})
+                        break
+                continue
+            try:
+                event = json.loads(message.get("text") or "{}")
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "audio_request":
+                initial_slots = min(MAX_DEVICE_AUDIO_SLOTS, initial_slots + max(0, int(event.get("slots", 0))))
+            elif event.get("type") in {"begin", "append_audio"}:
+                initial_message = message if event["type"] == "append_audio" else None
+                break
+        await idle_detector.close()
+        last_activity = time.monotonic()
+        mcp_tools = []
+        mcp_prompt = ""
+        if HA_MCP_ENABLED:
+            ha_mcp = HomeAssistantMcpClient(HA_MCP_URL, HOME_ASSISTANT_TOKEN)
+            await ha_mcp.connect()
+            mcp_tools = await ha_mcp.get_openai_tools()
+            with suppress(Exception):
+                mcp_prompt = await ha_mcp.get_prompt()
         async with websockets.connect(
             REALTIME_URL,
             additional_headers=headers,
             max_size=None,
         ) as openai_ws:
             log("connected to OpenAI realtime")
-            tool_lock = asyncio.Lock()
             openai_ready = asyncio.Event()
             audio_chunks = 0
             buffered_audio = bytearray()
@@ -585,7 +500,7 @@ async def relay(client_ws: WebSocket):
             last_output_audio_delta_at = 0.0
             pending_audio_events: deque[bytes] = deque()
             client_send_lock = asyncio.Lock()
-            device_audio_slots = 0
+            device_audio_slots = initial_slots
             gateway_response_id = 0
             gateway_audio_seq = 0
             response_audio_done = False
@@ -593,8 +508,12 @@ async def relay(client_ws: WebSocket):
             playback_complete_sent = False
             follow_up_requested = False
             wake_detector = WakeWordDetector()
+            microphone_resampler = MicrophoneResampler()
+            pending_tool_calls = {}
+            seen_commits = set()
+            browser_client = False
 
-            await configure_openai(openai_ws)
+            await configure_openai(openai_ws, mcp_tools, mcp_prompt)
 
             async def send_requested_audio(
                 slot_count: Optional[int] = None,
@@ -627,11 +546,37 @@ async def relay(client_ws: WebSocket):
                         and not pending_audio_events
                         and not playback_complete_sent
                     ):
+                        should_follow_up = follow_up_requested or CONTINUOUS_CONVERSATION
+                        if should_follow_up:
+                            # Follow-up turns are hands-free, so enable server
+                            # VAD only after the push-to-talk reply is delivered.
+                            await openai_ws.send(
+                                json.dumps(
+                                    {
+                                        "type": "session.update",
+                                        "session": {
+                                            "type": "realtime",
+                                            "audio": {
+                                                "input": {
+                                                    "turn_detection": {
+                                                        "type": "server_vad",
+                                                        "threshold": 0.5,
+                                                        "prefix_padding_ms": 300,
+                                                        "silence_duration_ms": 900,
+                                                        "create_response": False,
+                                                        "interrupt_response": False,
+                                                    }
+                                                }
+                                            },
+                                        },
+                                    }
+                                )
+                            )
                         await client_ws.send_text(
                             json.dumps(
                                 {
                                     "type": "gateway.playback_complete",
-                                    "follow_up": follow_up_requested,
+                                    "follow_up": should_follow_up,
                                     "timeout_ms": FOLLOW_UP_TIMEOUT_MS,
                                 }
                             )
@@ -671,17 +616,29 @@ async def relay(client_ws: WebSocket):
 
             async def client_to_openai():
                 nonlocal audio_chunks, buffered_audio, raw_turn_audio
+                nonlocal browser_client, initial_message, last_activity
                 nonlocal sent_audio_bytes, commit_requested
                 nonlocal follow_up_requested
                 try:
                     while True:
-                        message = await client_ws.receive()
+                        if initial_message is not None:
+                            message, initial_message = initial_message, None
+                        else:
+                            message = await client_ws.receive()
+                        if message.get("type") == "websocket.disconnect":
+                            log(
+                                "device websocket disconnected: "
+                                f"code={message.get('code')} reason={message.get('reason', '')}"
+                            )
+                            return
                         binary_message = message.get("bytes")
                         if binary_message is not None:
                             if len(binary_message) < 2:
                                 continue
                             frame_type = binary_message[0]
                             audio_data = binary_message[1:]
+                            if frame_type == 1:
+                                audio_data = microphone_resampler.convert(audio_data)
                             if frame_type == 1:
                                 payload = {
                                     "type": "append_audio",
@@ -704,9 +661,12 @@ async def relay(client_ws: WebSocket):
                                 log(f"ignoring malformed client message: {exc}")
                                 continue
                         kind = payload.get("type")
+                        if kind == "append_audio" and binary_message is None:
+                            browser_client = True
                         if not openai_ready.is_set():
-                            await openai_ready.wait()
+                            await asyncio.wait_for(openai_ready.wait(), timeout=15)
                         if kind == "append_audio":
+                            last_activity = time.monotonic()
                             if audio_chunks == 0 and sent_audio_bytes == 0 and not buffered_audio:
                                 follow_up_requested = False
                                 await openai_ws.send(
@@ -775,7 +735,10 @@ async def relay(client_ws: WebSocket):
                             sent_audio_bytes = 0
                             raw_turn_audio.clear()
                             audio_chunks = 0
-                        elif kind == "cancel_follow_up":
+                        elif kind in {"cancel_follow_up", "end_conversation"}:
+                            await client_ws.close(code=1000)
+                            return
+                        elif kind == "discard_input":
                             buffered_audio.clear()
                             raw_turn_audio.clear()
                             sent_audio_bytes = 0
@@ -798,11 +761,10 @@ async def relay(client_ws: WebSocket):
                             continue
                         elif kind == "response.create":
                             await openai_ws.send(json.dumps({"type": "response.create"}))
-                        elif kind in {"ping", "pong"}:
+                        elif kind in {"ping", "pong", "begin"}:
                             continue
                         else:
-                            log(f"forwarding passthrough event from device: {kind}")
-                            await openai_ws.send(json.dumps(payload))
+                            log(f"ignoring unsupported client event: {kind}")
                 except (WebSocketDisconnect, RuntimeError):
                     pass
                 finally:
@@ -814,10 +776,11 @@ async def relay(client_ws: WebSocket):
                 nonlocal audio_chunks, buffered_audio, raw_turn_audio, sent_audio_bytes
                 nonlocal response_audio_done, playback_complete_sent
                 nonlocal response_has_audio
-                nonlocal follow_up_requested
+                nonlocal follow_up_requested, last_activity
                 async for message in openai_ws:
                     event = json.loads(message)
                     event_type = event.get("type", "unknown")
+                    last_activity = time.monotonic()
                     if event_type in {
                         "session.updated",
                         "input_audio_buffer.committed",
@@ -848,74 +811,59 @@ async def relay(client_ws: WebSocket):
                         response_audio_done = False
                         response_has_audio = False
                         playback_complete_sent = False
-                        if pending_audio_events:
-                            log(
-                                "dropping unsent audio from previous response: "
-                                f"{len(pending_audio_events)} chunks"
-                            )
-                            pending_audio_events.clear()
                         log(f"gateway response_id={gateway_response_id} started")
                     if event_type == "session.updated":
                         openai_ready.set()
                         log("OpenAI realtime session is ready")
-                    if event.get("type") == "response.function_call_arguments.done":
-                        async with tool_lock:
-                            tool_name = str(event.get("name", ""))
-                            call_id = str(event.get("call_id", ""))
-                            log(f"running HA tool: {tool_name}")
-                            if tool_name == "expect_follow_up":
-                                follow_up_requested = True
-                                tool_result = {"ok": True, "follow_up": True}
-                            else:
-                                try:
-                                    arguments = json.loads(event.get("arguments") or "{}")
-                                except json.JSONDecodeError:
-                                    arguments = {}
-                                try:
-                                    tool_result = await run_tool(tool_name, arguments)
-                                except HTTPException as exc:
-                                    tool_result = {"ok": False, "error": exc.detail}
-                            await openai_ws.send(
-                                json.dumps(
-                                    {
-                                        "type": "conversation.item.create",
-                                        "item": {
-                                            "type": "function_call_output",
-                                            "call_id": call_id,
-                                            "output": json.dumps(tool_result),
-                                        },
-                                    }
-                                )
-                            )
-                            await openai_ws.send(json.dumps({"type": "response.create"}))
-                    if event_type == "input_audio_buffer.committed" and commit_requested:
-                        log("creating response after committed audio buffer")
-                        commit_requested = False
-                        output_audio_chunks = 0
-                        last_output_audio_delta_at = 0.0
-                        pending_audio_events.clear()
+                    if event_type == "response.function_call_arguments.done":
+                        pending_tool_calls[event["call_id"]] = event
+                    if event_type == "response.done" and pending_tool_calls:
+                        # Wait until the complete response has ended before continuing.
+                        # Several tool calls in one response produce one continuation.
+                        calls = list(pending_tool_calls.values())
+                        pending_tool_calls.clear()
+                        for call in calls:
+                            name = call.get("name", "")
+                            try:
+                                if name == "expect_follow_up":
+                                    follow_up_requested = True
+                                    result = {"ok": True}
+                                else:
+                                    result = await ha_mcp.call_openai_tool(name, json.loads(call.get("arguments") or "{}")) if ha_mcp else {"ok": False, "error": "MCP disabled"}
+                            except Exception:
+                                log(f"tool failed: {name}")
+                                result = {"ok": False, "error": "Tool execution failed"}
+                            await openai_ws.send(json.dumps({
+                                "type": "conversation.item.create",
+                                "item": {"type": "function_call_output", "call_id": call["call_id"],
+                                         "output": json.dumps(result)},
+                            }))
                         await openai_ws.send(json.dumps({"type": "response.create"}))
-                    elif event_type == "input_audio_buffer.committed":
-                        if raw_turn_audio:
-                            stats = analyze_pcm16(bytes(raw_turn_audio))
-                            log(
-                                "VAD committed turn audio: "
-                                + json.dumps(stats, ensure_ascii=True)
-                            )
+                        continue
+                    if event_type == "input_audio_buffer.committed":
+                        item_id = event.get("item_id")
+                        if item_id and item_id not in seen_commits:
+                            seen_commits.add(item_id)
+                            await openai_ws.send(json.dumps({"type": "response.create"}))
+                        commit_requested = False
                         buffered_audio.clear()
                         raw_turn_audio.clear()
                         sent_audio_bytes = 0
                         audio_chunks = 0
+                        microphone_resampler.reset()
                     if (
                         event_type == "error"
                         and event.get("error", {}).get("code") == "input_audio_buffer_commit_empty"
                     ):
                         commit_requested = False
+                        response_audio_done = True
+                        await send_requested_audio()
+                        log("ignored an empty input commit and returned device to idle")
+                        continue
                     if event_type == "response.done":
                         output_audio_chunks = 0
                         last_output_audio_delta_at = 0.0
-                        if response_has_audio:
-                            response_audio_done = True
+                        response_audio_done = True
                     if event_type == "response.output_audio.delta":
                         response_has_audio = True
                         delta = event.get("delta")
@@ -923,6 +871,11 @@ async def relay(client_ws: WebSocket):
                             raw = base64.b64decode(delta)
                             if len(raw) > AUDIO_DELTA_SLICE_BYTES:
                                 log(f"splitting audio delta of {len(raw)} bytes")
+                            if browser_client:
+                                await send_event_to_client(client_ws, event)
+                                continue
+                            if sum(map(len, pending_audio_events)) + len(raw) > MAX_AUDIO_BACKLOG_BYTES:
+                                raise RuntimeError("Device playback stalled: audio backlog exceeded")
                             for start in range(0, len(raw), AUDIO_DELTA_SLICE_BYTES):
                                 pending_audio_events.append(
                                     raw[start:start + AUDIO_DELTA_SLICE_BYTES]
@@ -937,14 +890,29 @@ async def relay(client_ws: WebSocket):
                             log("follow-up enabled by assistant question")
                     if event_type == "error":
                         log(f"OpenAI error payload: {json.dumps(event)}")
-                    async with client_send_lock:
-                        await send_event_to_client(client_ws, event)
-                    if event_type == "response.done" and response_has_audio:
+                    if browser_client or event_type in DEVICE_EVENT_TYPES:
+                        async with client_send_lock:
+                            await send_event_to_client(client_ws, event)
+                    if event_type == "response.done":
                         await send_requested_audio()
+                log(
+                    "OpenAI websocket ended: "
+                    f"code={openai_ws.close_code} reason={openai_ws.close_reason}"
+                )
+
+            async def expire_session():
+                started = time.monotonic()
+                while True:
+                    await asyncio.sleep(1)
+                    now = time.monotonic()
+                    if now - last_activity > SESSION_IDLE_SECONDS or now - started > 3300:
+                        await client_ws.close(code=1000)
+                        return
 
             tasks = [
-                asyncio.create_task(client_to_openai()),
-                asyncio.create_task(openai_to_client()),
+                asyncio.create_task(client_to_openai(), name="device-input"),
+                asyncio.create_task(openai_to_client(), name="openai-output"),
+                asyncio.create_task(expire_session(), name="session-expiry"),
             ]
             done, pending = await asyncio.wait(
                 tasks,
@@ -955,6 +923,7 @@ async def relay(client_ws: WebSocket):
                 with suppress(asyncio.CancelledError):
                     await task
             for task in done:
+                log(f"relay task ended: {task.get_name()} cancelled={task.cancelled()}")
                 exc = task.exception()
                 if exc:
                     raise exc
@@ -964,7 +933,12 @@ async def relay(client_ws: WebSocket):
             await client_ws.send_json(
                 {"type": "error", "message": f"OpenAI realtime error: {exc}"}
             )
-        raise
+    finally:
+        await idle_detector.close()
+        if ha_mcp is not None:
+            await ha_mcp.close()
+        with suppress(Exception):
+            await client_ws.close()
 
 
 if __name__ == "__main__":

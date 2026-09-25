@@ -3,3 +3,5 @@ uvicorn[standard]==0.35.0
 websockets==15.0.1
 httpx==0.28.1
 wyoming==1.10.0
+mcp==1.27.2
+sse-starlette==2.4.1

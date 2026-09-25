@@ -10,7 +10,8 @@ Realtime voice stack for `M5Stack Atom Echo` with two parts:
 - push-to-talk on the M5Stack button
 - streams microphone audio over WebSocket to the local gateway
 - gets realtime spoken responses back from OpenAI
-- allows the model to call Home Assistant services
+- exposes Home Assistant MCP tools to the voice model
+- authenticates devices with a gateway token
 
 ## Repository layout
 
@@ -31,3 +32,6 @@ Realtime voice stack for `M5Stack Atom Echo` with two parts:
 - The repository intentionally does not include local secrets.
 - The firmware keeps `firmware_config.h` untracked on purpose.
 - The add-on is designed to run inside Home Assistant, but the gateway app can also be started manually for debugging.
+
+See [implementation and verification notes](IMPLEMENTATION.md) for the current
+Realtime/MCP changes, device-test setup, and remaining limitations.

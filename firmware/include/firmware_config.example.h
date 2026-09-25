@@ -9,6 +9,8 @@ constexpr char GATEWAY_HOST[] = "homeassistant.local";
 constexpr uint16_t GATEWAY_PORT = 8765;
 constexpr char GATEWAY_PATH[] = "/ws";
 
+constexpr char GATEWAY_TOKEN[] = "REPLACE_WITH_GATEWAY_TOKEN";
+
 constexpr bool USE_TLS = false;
 constexpr char GATEWAY_TLS_FINGERPRINT[] = "";
 

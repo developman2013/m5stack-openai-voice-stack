@@ -22,7 +22,7 @@ PlatformIO firmware for `M5Stack Atom Echo` that talks directly to the local voi
 ## Setup
 
 1. Copy `include/firmware_config.example.h` to `include/firmware_config.h`.
-2. Fill in Wi-Fi credentials and gateway address.
+2. Fill in Wi-Fi credentials, gateway address and matching `GATEWAY_TOKEN`.
 3. Build and flash the firmware.
 
 ## Working with local debug mode
@@ -54,3 +54,6 @@ This avoids the usual `pio run -t upload` instability by separating build, flash
 - I2S BCLK: `GPIO19`
 - microphone DIN: `GPIO23`
 - speaker DOUT: `GPIO22`
+
+During an answer, press the button to end the conversation. After reconnection,
+hold it again to start a new turn. Voice barge-in is not implemented.

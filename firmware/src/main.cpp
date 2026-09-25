@@ -224,6 +224,22 @@ void startListening() {
     return;
   }
 
+  if (deviceState == DeviceState::Playing || deviceState == DeviceState::Thinking) {
+    listening = false;
+    wakeListening = false;
+    followUpRequested = false;
+    responsePlaybackComplete = false;
+    clearOutboundAudio();
+    portENTER_CRITICAL(&playbackMux);
+    playbackQueue.clear();
+    portEXIT_CRITICAL(&playbackMux);
+    stopAudioI2S();
+    enqueueOutbound(String("{\"type\":\"end_conversation\"}"));
+    setState(DeviceState::Idle);
+    refreshLed();
+    return;
+  }
+  enqueueOutbound(String("{\"type\":\"begin\"}"));
   wakeListening = false;
   responsePlaybackComplete = false;
   followUpRequested = false;
@@ -621,6 +637,12 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_DISCONNECTED:
       wsConnected = false;
+      portENTER_CRITICAL(&playbackMux);
+      playbackQueue.clear();
+      portEXIT_CRITICAL(&playbackMux);
+      responsePlaybackComplete = false;
+      clearOutboundAudio();
+      stopAudioI2S();
       listening = false;
       wakeListening = false;
       commandAudioStartsAtMs = 0;
@@ -777,7 +799,7 @@ void playbackTask(void*) {
     portEXIT_CRITICAL(&playbackMux);
 
     if (!playbackPrimed && queuedChunks > 0 &&
-        queuedChunks < PLAYBACK_START_BUFFER_CHUNKS) {
+        queuedChunks < PLAYBACK_START_BUFFER_CHUNKS && !responsePlaybackComplete) {
       vTaskDelay(pdMS_TO_TICKS(5));
       continue;
     }
@@ -897,6 +919,8 @@ void processFollowUpTimeout() {
 }
 
 void connectWebSocket() {
+  static String authHeader = String("Authorization: Bearer ") + firmware_config::GATEWAY_TOKEN;
+  ws.setExtraHeaders(authHeader.c_str());
   ws.begin(GATEWAY_HOST, GATEWAY_PORT, GATEWAY_PATH);
   ws.onEvent(webSocketEvent);
   ws.setReconnectInterval(WS_RECONNECT_MS);
