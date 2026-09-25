@@ -122,6 +122,8 @@ void processSerialProvisioning() {
           network["type"] = "scan.network";
           network["ssid"] = WiFi.SSID(i);
           network["rssi"] = WiFi.RSSI(i);
+          network["channel"] = WiFi.channel(i);
+          network["band"] = WiFi.channel(i) <= 14 ? "2.4 GHz" : "5 GHz";
           network["secure"] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
           serializeJson(network, Serial);
           Serial.println();
