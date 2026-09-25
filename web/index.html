@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Install M5Stack Voice Firmware</title>
+  <script type="module" src="https://unpkg.com/esp-web-tools@10.2.1/dist/web/install-button.js?module"></script>
+  <style>
+    body { max-width: 700px; margin: 3rem auto; padding: 0 1rem; font: 16px/1.5 system-ui, sans-serif; }
+    code { background: #eee; padding: .15rem .35rem; border-radius: .25rem; }
+    .warning { background: #fff3cd; padding: 1rem; border-radius: .5rem; }
+  </style>
+</head>
+<body>
+  <h1>Install M5Stack Voice Firmware</h1>
+  <p>Connect an M5Stack Atom Echo to this computer with a USB data cable, then install the firmware.</p>
+  <p class="warning">Use Chrome or Edge on a desktop computer. The browser needs permission to access the USB serial device.</p>
+  <esp-web-install-button manifest="./manifest.json"></esp-web-install-button>
+  <h2>After flashing</h2>
+  <p>The device will start its setup Wi-Fi network. Connect to it from your phone and enter your Wi-Fi and gateway settings.</p>
+</body>
+</html>
