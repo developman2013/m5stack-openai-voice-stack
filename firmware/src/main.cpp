@@ -103,6 +103,35 @@ bool portalActive = false;
 void setState(DeviceState nextState);
 void refreshLed();
 
+void processSerialProvisioning() {
+  static String line;
+  while (Serial.available()) {
+    const char ch = static_cast<char>(Serial.read());
+    if (ch == '\n' || ch == '\r') {
+      line.trim();
+      if (line.length() == 0) continue;
+      JsonDocument doc;
+      const auto error = deserializeJson(doc, line);
+      if (error || doc["type"] != "provision") {
+        Serial.println("{\"type\":\"provision.error\",\"message\":\"expected provision JSON\"}");
+      } else if (String(doc["ssid"] | "").isEmpty() || String(doc["gateway"] | "").isEmpty() || String(doc["token"] | "").isEmpty()) {
+        Serial.println("{\"type\":\"provision.error\",\"message\":\"ssid, gateway and token are required\"}");
+      } else {
+        preferences.putString("ssid", doc["ssid"].as<const char*>());
+        preferences.putString("password", doc["password"] | "");
+        preferences.putString("gateway", doc["gateway"].as<const char*>());
+        preferences.putString("token", doc["token"].as<const char*>());
+        Serial.println("{\"type\":\"provision.ok\",\"message\":\"saved; restarting\"}");
+        delay(300);
+        ESP.restart();
+      }
+      line = "";
+    } else if (line.length() < 1024) {
+      line += ch;
+    }
+  }
+}
+
 bool hasTemplateConfig() {
   return runtimeWifiSsid == "YOUR_WIFI_SSID" || runtimeGatewayToken == "REPLACE_WITH_GATEWAY_TOKEN";
 }
@@ -153,7 +182,7 @@ std::deque<std::vector<uint8_t>> playbackQueue;
 std::deque<String> outboundQueue;
 std::deque<std::vector<uint8_t>> outboundAudioQueue;
 
-constexpr char FIRMWARE_VERSION[] = "rt-gw-1.2";
+constexpr char FIRMWARE_VERSION[] = "rt-gw-1.3";
 
 void stopAudioI2S();
 bool configureMicrophoneI2S();
@@ -1059,6 +1088,7 @@ void setup() {
 }
 
 void loop() {
+  processSerialProvisioning();
   if (portalActive) {
     dnsServer.processNextRequest();
     portalServer.handleClient();

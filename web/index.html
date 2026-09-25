@@ -16,7 +16,40 @@
   <p>Connect an M5Stack Atom Echo to this computer with a USB data cable, then install the firmware.</p>
   <p class="warning">Use Chrome or Edge on a desktop computer. The browser needs permission to access the USB serial device.</p>
   <esp-web-install-button manifest="./manifest.json"></esp-web-install-button>
-  <h2>After flashing</h2>
-  <p>The device will start its setup Wi-Fi network. Connect to it from your phone and enter your Wi-Fi and gateway settings.</p>
+  <h2>Configure over USB</h2>
+  <p>After flashing, keep the USB cable connected and configure the device here. This avoids connecting your phone to the device setup Wi-Fi.</p>
+  <form id="config">
+    <label>Wi-Fi network<br><input id="ssid" required></label><br>
+    <label>Wi-Fi password<br><input id="password" type="password"></label><br>
+    <label>Gateway host or IP<br><input id="gateway" value="homeassistant.local" required></label><br>
+    <label>Gateway token<br><input id="token" type="password" required></label><br>
+    <button type="submit">Send configuration over USB</button>
+  </form>
+  <pre id="status" aria-live="polite"></pre>
+  <p class="warning">Web Serial requires Chrome or Edge on a computer. If USB configuration is unavailable, the device still provides its setup Wi-Fi portal.</p>
+  <script>
+    const form = document.querySelector('#config');
+    const status = document.querySelector('#status');
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      if (!('serial' in navigator)) { status.textContent = 'Web Serial is not supported by this browser.'; return; }
+      let port;
+      try {
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 });
+        const payload = { type: 'provision', ssid: ssid.value, password: password.value, gateway: gateway.value, token: token.value };
+        await port.writable.getWriter().write(new TextEncoder().encode(JSON.stringify(payload) + '\n'));
+        status.textContent = 'Configuration sent. Waiting for device confirmation…';
+        const reader = port.readable.getReader();
+        const decoder = new TextDecoder(); let buffer = '';
+        while (true) {
+          const { value, done } = await reader.read(); if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split(/\r?\n/); buffer = lines.pop();
+          for (const line of lines) if (line.includes('provision.ok') || line.includes('provision.error')) { status.textContent = line; await reader.cancel(); await port.close(); return; }
+        }
+      } catch (error) { status.textContent = `USB configuration failed: ${error.message}`; try { await port?.close(); } catch (_) {} }
+    });
+  </script>
 </body>
 </html>
