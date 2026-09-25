@@ -1,6 +1,6 @@
 {
   "name": "M5Stack OpenAI Voice Stack",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "builds": [{
     "chipFamily": "ESP32",
     "parts": [
