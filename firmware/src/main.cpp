@@ -99,6 +99,9 @@ String runtimeGatewayHost;
 String runtimeGatewayToken;
 bool portalActive = false;
 
+void setState(DeviceState nextState);
+void refreshLed();
+
 bool hasTemplateConfig() {
   return runtimeWifiSsid == "YOUR_WIFI_SSID" || runtimeGatewayToken == "REPLACE_WITH_GATEWAY_TOKEN";
 }
