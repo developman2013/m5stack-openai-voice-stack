@@ -1,15 +1,12 @@
 {
   "name": "M5Stack OpenAI Voice Stack",
-  "version": "0.1.0",
-  "builds": [
-    {
-      "chipFamily": "ESP32",
-      "parts": [
-        {
-          "path": "https://github.com/developman2013/m5stack-openai-voice-stack/releases/latest/download/m5stack-atom-echo.bin",
-          "offset": 0
-        }
-      ]
-    }
-  ]
+  "version": "0.1.1",
+  "builds": [{
+    "chipFamily": "ESP32",
+    "parts": [
+      {"path": "https://github.com/developman2013/m5stack-openai-voice-stack/releases/latest/download/bootloader.bin", "offset": 4096},
+      {"path": "https://github.com/developman2013/m5stack-openai-voice-stack/releases/latest/download/partitions.bin", "offset": 32768},
+      {"path": "https://github.com/developman2013/m5stack-openai-voice-stack/releases/latest/download/firmware.bin", "offset": 65536}
+    ]
+  }]
 }
