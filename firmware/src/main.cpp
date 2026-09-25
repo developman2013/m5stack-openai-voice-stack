@@ -41,6 +41,7 @@ constexpr i2s_port_t I2S_PORT_AUDIO = I2S_NUM_0;
 
 constexpr uint32_t BUTTON_DEBOUNCE_MS = 30;
 constexpr uint32_t WIFI_RETRY_MS = 5000;
+constexpr uint32_t WIFI_PORTAL_FALLBACK_MS = 30000;
 constexpr uint32_t WS_RECONNECT_MS = 2000;
 constexpr size_t PLAYBACK_MAX_BUFFER_CHUNKS = MAX_PLAYBACK_QUEUE_CHUNKS;
 constexpr size_t PLAYBACK_START_BUFFER_CHUNKS = 8;
@@ -602,12 +603,18 @@ void connectWiFi() {
   refreshLed();
 
   uint32_t started = millis();
+  uint32_t lastRetryLog = started;
   while (WiFi.status() != WL_CONNECTED) {
     delay(250);
     Serial.print('.');
-    if (millis() - started > WIFI_RETRY_MS) {
+    if (millis() - started > WIFI_PORTAL_FALLBACK_MS) {
+      Serial.println("\n[wifi] unable to connect; starting setup portal");
+      startPortal();
+      return;
+    }
+    if (millis() - lastRetryLog > WIFI_RETRY_MS) {
       Serial.println("\n[wifi] retrying connection");
-      started = millis();
+      lastRetryLog = millis();
     }
   }
 
