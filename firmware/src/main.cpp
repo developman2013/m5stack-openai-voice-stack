@@ -160,7 +160,8 @@ void processSerialProvisioning() {
             preferences.putString("gateway", doc["gateway"].as<const char*>());
             preferences.putString("token", doc["token"].as<const char*>());
             Serial.println("{\"type\":\"provision.ok\",\"message\":\"saved; restarting\"}");
-            delay(300);
+            Serial.flush();
+            delay(1000);
             ESP.restart();
           }
           http.end();
