@@ -37,6 +37,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         env:
           RELEASE_VERSION: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           git fetch origin main
           git checkout -B main origin/main
@@ -49,3 +50,4 @@ jobs:
           git diff --cached --quiet && exit 0
           git commit -m "chore: publish firmware ${RELEASE_VERSION} to installer"
           git push origin main
+          gh workflow run pages.yml --ref main
