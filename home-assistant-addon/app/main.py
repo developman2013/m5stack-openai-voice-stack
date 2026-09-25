@@ -661,6 +661,12 @@ async def relay(client_ws: WebSocket):
                                 log(f"ignoring malformed client message: {exc}")
                                 continue
                         kind = payload.get("type")
+                        # `begin` is a gateway control message from devices. It
+                        # starts the relay session and must never be sent to
+                        # the OpenAI Realtime socket.
+                        if kind == "begin":
+                            last_activity = time.monotonic()
+                            continue
                         if kind == "append_audio" and binary_message is None:
                             browser_client = True
                         if not openai_ready.is_set():
