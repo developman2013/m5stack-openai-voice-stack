@@ -116,17 +116,17 @@ void processSerialProvisioning() {
       const String command = doc["type"] | "";
       if (command == "scan") {
         const int count = WiFi.scanNetworks(false, true);
-        JsonDocument result;
-        result["type"] = "scan.result";
-        JsonArray networks = result["networks"].to<JsonArray>();
+        Serial.println("{\"type\":\"scan.begin\"}");
         for (int i = 0; i < count; ++i) {
-          JsonObject network = networks.add<JsonObject>();
+          JsonDocument network;
+          network["type"] = "scan.network";
           network["ssid"] = WiFi.SSID(i);
           network["rssi"] = WiFi.RSSI(i);
           network["secure"] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+          serializeJson(network, Serial);
+          Serial.println();
         }
-        serializeJson(result, Serial);
-        Serial.println();
+        Serial.printf("{\"type\":\"scan.done\",\"count\":%d}\n", count);
         WiFi.scanDelete();
       } else if (error || command != "provision" && command != "validate") {
         Serial.println("{\"type\":\"provision.error\",\"message\":\"expected provision JSON\"}");
