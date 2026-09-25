@@ -1,0 +1,19 @@
+name: Build app
+on:
+  workflow_call:
+    inputs:
+      app: {required: true, type: string}
+      publish: {required: true, type: boolean}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: home-assistant/builder@2026.06.0
+        with:
+          args: "--${{ inputs.app }}"
+          image: ghcr.io/developman2013/m5stack-openai-voice-gateway
+          target: ${{ inputs.publish && 'all' || 'test' }}
