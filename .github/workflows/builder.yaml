@@ -39,7 +39,7 @@ jobs:
           fi
   build-app:
     needs: init
-    if: github.event_name == 'push' || needs.init.outputs.changed == 'true'
+    if: always()
     permissions:
       contents: read
       id-token: write
