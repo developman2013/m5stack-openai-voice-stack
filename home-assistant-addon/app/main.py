@@ -713,6 +713,32 @@ async def relay(client_ws: WebSocket):
                                     f"wake word detected for {client_host}: "
                                     f"{detected_name}"
                                 )
+                                # Wake-word turns have no button-release
+                                # commit. Enable Realtime server VAD so the
+                                # end of speech commits the buffer and starts
+                                # the response automatically.
+                                await openai_ws.send(
+                                    json.dumps(
+                                        {
+                                            "type": "session.update",
+                                            "session": {
+                                                "type": "realtime",
+                                                "audio": {
+                                                    "input": {
+                                                        "turn_detection": {
+                                                            "type": "server_vad",
+                                                            "threshold": 0.5,
+                                                            "prefix_padding_ms": 300,
+                                                            "silence_duration_ms": 900,
+                                                            "create_response": True,
+                                                            "interrupt_response": False,
+                                                        }
+                                                    }
+                                                },
+                                            },
+                                        }
+                                    )
+                                )
                                 async with client_send_lock:
                                     await client_ws.send_text(
                                         json.dumps(
