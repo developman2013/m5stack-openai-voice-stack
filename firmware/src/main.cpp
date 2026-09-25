@@ -165,7 +165,9 @@ void processSerialProvisioning() {
           }
           http.end();
         }
-        WiFi.disconnect(true, true);
+        if (command != "validate") {
+          WiFi.disconnect(true, true);
+        }
       }
       line = "";
     } else if (line.length() < 1024) {
