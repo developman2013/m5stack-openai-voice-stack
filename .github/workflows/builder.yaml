@@ -39,14 +39,14 @@ jobs:
           fi
   build-app:
     needs: init
-    if: needs.init.outputs.changed == 'true'
+    if: github.event_name == 'push' || needs.init.outputs.changed == 'true'
     permissions:
       contents: read
       id-token: write
       packages: write
     strategy:
       matrix:
-        app: ${{ fromJSON(needs.init.outputs.changed_apps) }}
+        app: [home-assistant-addon]
     uses: ./.github/workflows/build-app.yaml
     with:
       app: ${{ matrix.app }}
