@@ -1101,6 +1101,7 @@ void connectWebSocket() {
 void setup() {
   Serial.begin(115200);
   esp_log_level_set("wifi", ESP_LOG_NONE);
+  esp_log_level_set("WiFiGeneric", ESP_LOG_NONE);
   delay(300);
   Serial.printf("[boot] firmware=%s\n", FIRMWARE_VERSION);
 
