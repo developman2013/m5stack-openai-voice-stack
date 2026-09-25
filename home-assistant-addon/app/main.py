@@ -22,6 +22,7 @@ from wyoming.event import async_read_event, async_write_event
 from wyoming.wake import Detect, Detection
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+GATEWAY_VERSION = os.getenv("GATEWAY_VERSION", "development")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-realtime-mini")
 OPENAI_VOICE = os.getenv("OPENAI_VOICE", "cedar")
 ASSISTANT_INSTRUCTIONS = os.getenv(
@@ -359,6 +360,7 @@ async def send_event_to_client(client_ws: WebSocket, event: dict[str, Any]) -> N
 async def health():
     return {
         "ok": True,
+        "gateway_version": GATEWAY_VERSION,
         "model": OPENAI_MODEL,
         "voice": OPENAI_VOICE,
         "ha_url": HOME_ASSISTANT_URL,
