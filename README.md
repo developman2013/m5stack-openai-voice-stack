@@ -19,13 +19,39 @@ Realtime voice stack for `M5Stack Atom Echo` with two parts:
 - `home-assistant-addon/config.yaml`: add-on metadata and options schema
 - `home-assistant-addon/app/main.py`: gateway server
 
-## First setup
+## First setup in Home Assistant
 
-1. In `firmware/include`, copy `firmware_config.example.h` to `firmware_config.h`.
-2. Fill in your Wi-Fi name, password, and gateway host in `firmware_config.h`.
+1. Open **Settings → Add-ons → Add-on store → ⋮ → Repositories**.
+2. Add `https://github.com/developman2013/m5stack-openai-voice-stack` and reload the store.
+3. Open **OpenAI Voice Gateway**, install it, and start it.
+4. In the add-on **Configuration** tab, set `openai_api_key`. Set a long random
+   `gateway_token`; the same value is flashed to each M5Stack.
+5. Keep `home_assistant_url` as `http://supervisor/core` and
+   `ha_mcp_url` as `http://supervisor/core/api/mcp` when running as an add-on.
+6. Open the add-on Web UI and check `/health`. It should return `"status": "ok"`.
+
+The image is pulled from GHCR automatically. Home Assistant installations on
+`amd64` and `aarch64` are supported.
+
+## First M5Stack setup
+
+1. Copy `firmware/include/firmware_config.example.h` to
+   `firmware/include/firmware_config.h`.
+2. Fill in Wi-Fi credentials, `GATEWAY_HOST` (the HA host name or IP), and the
+   same `GATEWAY_TOKEN` configured in the add-on.
 3. Build and flash the firmware from the `firmware/` directory.
-4. Copy `home-assistant-addon/` into your Home Assistant local add-ons folder.
-5. Install the add-on in Home Assistant and fill in the OpenAI settings.
+
+Before flashing, verify that the gateway is reachable from the same LAN. The
+default WebSocket endpoint is `ws://<gateway-host>:8765/ws`.
+
+## Diagnostics
+
+- `http://<ha-host>:8765/health` checks that the gateway process is alive and
+  reports whether OpenAI, the gateway token, and MCP are configured.
+- The add-on log shows WebSocket connects, wake-word events, MCP discovery, and
+  Realtime errors.
+- A device that connects but does not get audio usually has a mismatched token,
+  gateway host, or port. Reflash after changing any of those values.
 
 ## Notes
 
