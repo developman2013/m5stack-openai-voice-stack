@@ -1,12 +1,23 @@
 {
   "name": "M5Stack OpenAI Voice Stack",
-  "version": "0.1.3",
-  "builds": [{
-    "chipFamily": "ESP32",
-    "parts": [
-      {"path": "./assets/bootloader.bin", "offset": 4096},
-      {"path": "./assets/partitions.bin", "offset": 32768},
-      {"path": "./assets/firmware.bin", "offset": 65536}
-    ]
-  }]
+  "version": "0.1.4",
+  "builds": [
+    {
+      "chipFamily": "ESP32",
+      "parts": [
+        {
+          "path": "./assets/bootloader.bin",
+          "offset": 4096
+        },
+        {
+          "path": "./assets/partitions.bin",
+          "offset": 32768
+        },
+        {
+          "path": "./assets/firmware.bin",
+          "offset": 65536
+        }
+      ]
+    }
+  ]
 }
