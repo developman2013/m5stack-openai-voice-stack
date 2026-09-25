@@ -381,7 +381,7 @@ async def index():
     return HTMLResponse(PAGE)
 
 
-async def configure_openai(ws, tools=None, tool_prompt=""):
+async def configure_openai(ws, tools=None, tool_prompt="", *, server_vad=False):
     log(f"configuring OpenAI realtime session for model={OPENAI_MODEL} voice={OPENAI_VOICE}")
     await ws.send(
         json.dumps(
@@ -397,9 +397,21 @@ async def configure_openai(ws, tools=None, tool_prompt=""):
                         },
                         "input": {
                             "format": {"type": "audio/pcm", "rate": 24000},
-                            # The first turn is push-to-talk. The Realtime API
-                            # requires VAD to be disabled for a manual commit.
-                            "turn_detection": None,
+                            # Push-to-talk uses a manual commit. A wake-word
+                            # session must use server VAD so the device can
+                            # stop listening and the response can be created.
+                            "turn_detection": (
+                                {
+                                    "type": "server_vad",
+                                    "threshold": 0.5,
+                                    "prefix_padding_ms": 300,
+                                    "silence_duration_ms": 900,
+                                    "create_response": True,
+                                    "interrupt_response": False,
+                                }
+                                if server_vad
+                                else None
+                            ),
                         },
                     },
                     "instructions": ASSISTANT_INSTRUCTIONS + "\n" + tool_prompt
@@ -450,6 +462,7 @@ async def relay(client_ws: WebSocket):
     idle_detector = WakeWordDetector()
     initial_message = None
     initial_slots = 0
+    wake_activated = False
     last_activity = time.monotonic()
     try:
         # Idle microphone data stays local. No OpenAI session until activation.
@@ -465,6 +478,7 @@ async def relay(client_ws: WebSocket):
                 if binary[0] == 0 and WAKE_WORD_ENABLED:
                     detected = await idle_detector.feed(amplify_pcm16(binary[1:], WAKE_AUDIO_GAIN))
                     if detected:
+                        wake_activated = True
                         await client_ws.send_json({"type": "wake_word.detected", "name": detected})
                         break
                 continue
@@ -516,7 +530,12 @@ async def relay(client_ws: WebSocket):
             seen_commits = set()
             browser_client = False
 
-            await configure_openai(openai_ws, mcp_tools, mcp_prompt)
+            await configure_openai(
+                openai_ws,
+                mcp_tools,
+                mcp_prompt,
+                server_vad=wake_activated,
+            )
 
             async def send_requested_audio(
                 slot_count: Optional[int] = None,
