@@ -5,6 +5,7 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
+#include <HTTPClient.h>
 #include <driver/i2s.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -112,18 +113,56 @@ void processSerialProvisioning() {
       if (line.length() == 0) continue;
       JsonDocument doc;
       const auto error = deserializeJson(doc, line);
-      if (error || doc["type"] != "provision") {
+      const String command = doc["type"] | "";
+      if (command == "scan") {
+        const int count = WiFi.scanNetworks(false, true);
+        JsonDocument result;
+        result["type"] = "scan.result";
+        JsonArray networks = result["networks"].to<JsonArray>();
+        for (int i = 0; i < count; ++i) {
+          JsonObject network = networks.add<JsonObject>();
+          network["ssid"] = WiFi.SSID(i);
+          network["rssi"] = WiFi.RSSI(i);
+          network["secure"] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+        }
+        serializeJson(result, Serial);
+        Serial.println();
+        WiFi.scanDelete();
+      } else if (error || command != "provision" && command != "validate") {
         Serial.println("{\"type\":\"provision.error\",\"message\":\"expected provision JSON\"}");
       } else if (String(doc["ssid"] | "").isEmpty() || String(doc["gateway"] | "").isEmpty() || String(doc["token"] | "").isEmpty()) {
         Serial.println("{\"type\":\"provision.error\",\"message\":\"ssid, gateway and token are required\"}");
       } else {
-        preferences.putString("ssid", doc["ssid"].as<const char*>());
-        preferences.putString("password", doc["password"] | "");
-        preferences.putString("gateway", doc["gateway"].as<const char*>());
-        preferences.putString("token", doc["token"].as<const char*>());
-        Serial.println("{\"type\":\"provision.ok\",\"message\":\"saved; restarting\"}");
-        delay(300);
-        ESP.restart();
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(doc["ssid"].as<const char*>(), doc["password"] | "");
+        const uint32_t started = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - started < 15000) delay(100);
+        if (WiFi.status() != WL_CONNECTED) {
+          Serial.println("{\"type\":\"provision.error\",\"message\":\"Wi-Fi connection failed\"}");
+        } else {
+          String gateway = doc["gateway"].as<const char*>();
+          if (!gateway.startsWith("http://") && !gateway.startsWith("https://")) gateway = "http://" + gateway;
+          if (!gateway.endsWith("/")) gateway += ":" + String(GATEWAY_PORT);
+          HTTPClient http;
+          http.begin(gateway + "/health");
+          http.addHeader("Authorization", String("Bearer ") + doc["token"].as<const char*>());
+          const int status = http.GET();
+          if (status != HTTP_CODE_OK) {
+            Serial.printf("{\"type\":\"provision.error\",\"message\":\"Gateway check failed (HTTP %d)\"}\n", status);
+          } else if (command == "validate") {
+            Serial.println("{\"type\":\"validate.ok\",\"message\":\"Gateway and token are valid\"}");
+          } else {
+            preferences.putString("ssid", doc["ssid"].as<const char*>());
+            preferences.putString("password", doc["password"] | "");
+            preferences.putString("gateway", doc["gateway"].as<const char*>());
+            preferences.putString("token", doc["token"].as<const char*>());
+            Serial.println("{\"type\":\"provision.ok\",\"message\":\"saved; restarting\"}");
+            delay(300);
+            ESP.restart();
+          }
+          http.end();
+        }
+        WiFi.disconnect(true, true);
       }
       line = "";
     } else if (line.length() < 1024) {
