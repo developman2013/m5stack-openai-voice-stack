@@ -1,0 +1,15 @@
+{
+  "name": "M5Stack OpenAI Voice Stack",
+  "version": "0.1.0",
+  "builds": [
+    {
+      "chipFamily": "ESP32",
+      "parts": [
+        {
+          "path": "https://github.com/developman2013/m5stack-openai-voice-stack/releases/latest/download/m5stack-atom-echo.bin",
+          "offset": 0
+        }
+      ]
+    }
+  ]
+}

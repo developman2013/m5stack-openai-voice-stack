@@ -35,6 +35,10 @@ The image is pulled from GHCR automatically. Home Assistant installations on
 
 ## First M5Stack setup
 
+The browser installer is available from `web/index.html` when this repository
+is served as a static site. It installs a release build over USB; Chrome or
+Edge is required.
+
 1. Copy `firmware/include/firmware_config.example.h` to
    `firmware/include/firmware_config.h`.
 2. Fill in Wi-Fi credentials, `GATEWAY_HOST` (the HA host name or IP), and the
