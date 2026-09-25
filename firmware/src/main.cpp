@@ -2,6 +2,9 @@
 #include <ArduinoJson.h>
 #include <WebSocketsClient.h>
 #include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
 #include <driver/i2s.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -66,6 +69,9 @@ enum class AudioMode {
 };
 
 WebSocketsClient ws;
+WebServer portalServer(80);
+DNSServer dnsServer;
+Preferences preferences;
 Adafruit_NeoPixel led(1, PIN_LED, NEO_GRB + NEO_KHZ800);
 
 portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
@@ -87,6 +93,57 @@ uint32_t outboundAudioChunksSent = 0;
 uint32_t commandAudioStartsAtMs = 0;
 uint32_t followUpDeadlineMs = 0;
 uint32_t followUpTimeoutMs = DEFAULT_FOLLOW_UP_TIMEOUT_MS;
+String runtimeWifiSsid;
+String runtimeWifiPassword;
+String runtimeGatewayHost;
+String runtimeGatewayToken;
+bool portalActive = false;
+
+bool hasTemplateConfig() {
+  return runtimeWifiSsid == "YOUR_WIFI_SSID" || runtimeGatewayToken == "REPLACE_WITH_GATEWAY_TOKEN";
+}
+
+void loadRuntimeConfig() {
+  preferences.begin("voice", false);
+  runtimeWifiSsid = preferences.getString("ssid", WIFI_SSID);
+  runtimeWifiPassword = preferences.getString("password", WIFI_PASSWORD);
+  runtimeGatewayHost = preferences.getString("gateway", GATEWAY_HOST);
+  runtimeGatewayToken = preferences.getString("token", firmware_config::GATEWAY_TOKEN);
+}
+
+String portalPage() {
+  return F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>M5 Voice setup</title><style>body{font:16px system-ui;max-width:520px;margin:2rem auto;padding:1rem}"
+            "input{display:block;width:100%;box-sizing:border-box;padding:.7rem;margin:.35rem 0 1rem}button{padding:.7rem 1rem}</style>"
+            "<h1>M5 Voice setup</h1><form method='post' action='/save'>"
+            "<label>Wi-Fi network<input name='ssid' required></label>"
+            "<label>Wi-Fi password<input name='password' type='password'></label>"
+            "<label>Gateway host or IP<input name='gateway' value='homeassistant.local' required></label>"
+            "<label>Gateway token<input name='token' type='password' required></label>"
+            "<button>Save and connect</button></form>");
+}
+
+void startPortal() {
+  portalActive = true;
+  WiFi.mode(WIFI_AP);
+  String name = "M5-Voice-" + String((uint32_t)(ESP.getEfuseMac() & 0xFFFFFF), HEX);
+  WiFi.softAP(name.c_str());
+  dnsServer.start(53, "*", WiFi.softAPIP());
+  portalServer.onNotFound([]() { portalServer.send(200, "text/html", portalPage()); });
+  portalServer.on("/save", HTTP_POST, []() {
+    preferences.putString("ssid", portalServer.arg("ssid"));
+    preferences.putString("password", portalServer.arg("password"));
+    preferences.putString("gateway", portalServer.arg("gateway"));
+    preferences.putString("token", portalServer.arg("token"));
+    portalServer.send(200, "text/html", "<h1>Saved</h1><p>Restarting...</p>");
+    delay(800);
+    ESP.restart();
+  });
+  portalServer.begin();
+  Serial.printf("[portal] connect to %s, open http://%s\n", name.c_str(), WiFi.softAPIP().toString().c_str());
+  setState(DeviceState::Error);
+  refreshLed();
+}
 
 std::deque<std::vector<uint8_t>> playbackQueue;
 std::deque<String> outboundQueue;
@@ -527,13 +584,17 @@ bool configureSpeakerI2S() {
 }
 
 void connectWiFi() {
+  if (runtimeWifiSsid.isEmpty() || hasTemplateConfig()) {
+    startPortal();
+    return;
+  }
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true, true);
   delay(100);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
   WiFi.setMinSecurity(WIFI_AUTH_WPA2_PSK);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(runtimeWifiSsid.c_str(), runtimeWifiPassword.c_str());
   setState(DeviceState::WiFiConnecting);
   refreshLed();
 
@@ -946,9 +1007,10 @@ void processFollowUpTimeout() {
 }
 
 void connectWebSocket() {
-  static String authHeader = String("Authorization: Bearer ") + firmware_config::GATEWAY_TOKEN;
+  static String authHeader;
+  authHeader = String("Authorization: Bearer ") + runtimeGatewayToken;
   ws.setExtraHeaders(authHeader.c_str());
-  ws.begin(GATEWAY_HOST, GATEWAY_PORT, GATEWAY_PATH);
+  ws.begin(runtimeGatewayHost.c_str(), GATEWAY_PORT, GATEWAY_PATH);
   ws.onEvent(webSocketEvent);
   ws.setReconnectInterval(WS_RECONNECT_MS);
 }
@@ -977,7 +1039,9 @@ void setup() {
 
   setupButton();
   stopAudioI2S();
+  loadRuntimeConfig();
   connectWiFi();
+  if (portalActive) return;
   connectWebSocket();
 
   xTaskCreatePinnedToCore(microphoneTask, "microphone_task", 8192, nullptr, 1, nullptr, 0);
@@ -985,6 +1049,12 @@ void setup() {
 }
 
 void loop() {
+  if (portalActive) {
+    dnsServer.processNextRequest();
+    portalServer.handleClient();
+    delay(2);
+    return;
+  }
   ws.loop();
 
   std::vector<uint8_t> audioFrame;
