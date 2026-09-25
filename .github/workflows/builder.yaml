@@ -1,6 +1,6 @@
 name: Builder
 env:
-  MONITORED_FILES: "config.json config.yaml config.yml Dockerfile rootfs"
+  MONITORED_FILES: "config.json config.yaml config.yml Dockerfile rootfs app requirements.txt run.sh"
 on:
   pull_request:
     branches: [main]
@@ -39,14 +39,14 @@ jobs:
           fi
   build-app:
     needs: init
-    if: needs.init.outputs.changed == 'true'
+    if: always()
     permissions:
       contents: read
       id-token: write
       packages: write
     strategy:
       matrix:
-        app: ${{ fromJSON(needs.init.outputs.changed_apps) }}
+        app: [home-assistant-addon]
     uses: ./.github/workflows/build-app.yaml
     with:
       app: ${{ matrix.app }}
