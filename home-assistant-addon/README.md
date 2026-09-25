@@ -13,6 +13,8 @@ This add-on exposes a local WebSocket gateway for the M5Stack firmware and bridg
 - `openai_api_key`
 - `openai_model`
 - `openai_voice`
+- `gateway_token` (same secret in the firmware)
+- `ha_mcp_url` and Home Assistant MCP Server enabled
 
 ## Optional options
 
@@ -38,8 +40,8 @@ The M5Stack streams 16 kHz PCM audio to the gateway while idle. Wake-word audio
 is processed locally and is not forwarded to OpenAI. The device button remains
 available as a fallback push-to-talk control.
 
-When the assistant asks a real question or requests confirmation, the device
-opens a short follow-up window after playback. The default timeout is 5 seconds;
+By default the device opens a short follow-up window after every spoken reply.
+Set `continuous_conversation` false for question-only follow-up. The default timeout is 5 seconds;
 if no speech is detected, it returns to wake-word mode.
 
 If `home_assistant_token` is empty and the add-on runs inside Home Assistant, it can fall back to `SUPERVISOR_TOKEN`.
@@ -57,5 +59,9 @@ Notes:
 
 - Local mode uses the same `app/main.py` entry point as the add-on.
 - By default the last captured input audio is written to `/tmp/openai-last-input.pcm`.
-- `HOME_ASSISTANT_TOKEN` is optional for pure voice debugging, but required for `get_entity_state`, `search_entities`, and `call_home_assistant_service`.
+- Set `HA_MCP_ENABLED=false` for pure voice debugging. Otherwise configure
+  `HOME_ASSISTANT_TOKEN` and `HA_MCP_URL` for MCP tools.
 - For the real device, point `firmware/include/firmware_config.h` to the machine running this local gateway, not to `homeassistant.local`.
+
+OpenAI connects only after activation. Wake-word audio stays local.
+See [implementation notes](../IMPLEMENTATION.md) for acceptance testing.

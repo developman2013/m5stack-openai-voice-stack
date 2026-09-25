@@ -30,6 +30,11 @@ if [ -z "${OPENAI_API_KEY:-}" ]; then
   exit 1
 fi
 
+if [ -z "${GATEWAY_TOKEN:-}" ]; then
+  echo "GATEWAY_TOKEN is required" >&2
+  exit 1
+fi
+
 cd "$SCRIPT_DIR"
 if [ -x "$VENV_PYTHON" ]; then
   exec "$VENV_PYTHON" -m app.main
