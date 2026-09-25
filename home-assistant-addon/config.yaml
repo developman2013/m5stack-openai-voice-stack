@@ -1,8 +1,9 @@
 name: OpenAI Voice Gateway
-version: "0.4.0"
+version: "0.5.0"
 slug: openai_voice_gateway
 description: Realtime OpenAI voice gateway with a browser demo and Home Assistant hooks
-url: https://platform.openai.com/
+url: https://github.com/developman2013/m5stack-openai-voice-stack
+image: ghcr.io/developman2013/m5stack-openai-voice-gateway
 startup: services
 boot: auto
 init: false
@@ -13,7 +14,6 @@ webui: http://[HOST]:[PORT:8765]
 arch:
   - aarch64
   - amd64
-  - armv7
 ports:
   8765/tcp: 8765
 ports_description:

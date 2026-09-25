@@ -1,0 +1,25 @@
+name: Test
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v6.0.0
+        with: {python-version: "3.12"}
+      - run: python -m pip install -r home-assistant-addon/requirements.txt pytest pytest-asyncio
+      - run: PYTHONPATH=home-assistant-addon pytest -q home-assistant-addon/tests
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v6.0.0
+        with: {python-version: "3.12"}
+      - run: python -m pip install platformio
+      - run: cp firmware/include/firmware_config.example.h firmware/include/firmware_config.h
+      - run: pio run -d firmware
