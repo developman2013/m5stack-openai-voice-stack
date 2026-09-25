@@ -7,6 +7,7 @@ import json
 import os
 import struct
 import time
+import traceback
 from contextlib import suppress
 from collections import deque
 from typing import Any, Optional
@@ -936,7 +937,8 @@ async def relay(client_ws: WebSocket):
                 if exc:
                     raise exc
     except Exception as exc:
-        log(f"relay error for {client_host}: {exc}")
+        details = "".join(traceback.format_exception(exc)).strip()
+        log(f"relay error for {client_host}: {details}")
         if client_ws.client_state.name == "CONNECTED":
             await client_ws.send_json(
                 {"type": "error", "message": f"OpenAI realtime error: {exc}"}
