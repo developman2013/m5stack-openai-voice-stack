@@ -1,5 +1,6 @@
 #!/usr/bin/with-contenv bashio
 export OPENAI_API_KEY="$(bashio::config 'openai_api_key')"
+export GATEWAY_VERSION="$(bashio::addon.version)"
 export OPENAI_MODEL="$(bashio::config 'openai_model')"
 export OPENAI_VOICE="$(bashio::config 'openai_voice')"
 export ASSISTANT_INSTRUCTIONS="$(bashio::config 'instructions')"
