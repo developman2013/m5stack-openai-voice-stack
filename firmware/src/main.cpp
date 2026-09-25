@@ -41,6 +41,7 @@ constexpr uint32_t WIFI_RETRY_MS = 5000;
 constexpr uint32_t WS_RECONNECT_MS = 2000;
 constexpr size_t PLAYBACK_MAX_BUFFER_CHUNKS = MAX_PLAYBACK_QUEUE_CHUNKS;
 constexpr size_t PLAYBACK_START_BUFFER_CHUNKS = 8;
+constexpr size_t PLAYBACK_REFILL_BATCH_CHUNKS = 8;
 constexpr uint32_t PLAYBACK_IDLE_RESET_MS = 250;
 constexpr uint32_t WAKE_COMMAND_DELAY_MS = 300;
 constexpr uint32_t DEFAULT_FOLLOW_UP_TIMEOUT_MS = 5000;
@@ -91,7 +92,7 @@ std::deque<std::vector<uint8_t>> playbackQueue;
 std::deque<String> outboundQueue;
 std::deque<std::vector<uint8_t>> outboundAudioQueue;
 
-constexpr char FIRMWARE_VERSION[] = "rt-gw-1.1";
+constexpr char FIRMWARE_VERSION[] = "rt-gw-1.2";
 
 void stopAudioI2S();
 bool configureMicrophoneI2S();
@@ -791,6 +792,8 @@ void microphoneTask(void*) {
 void playbackTask(void*) {
   bool playbackPrimed = false;
   uint32_t lastChunkPlayedMs = 0;
+  uint32_t starvationStartedMs = 0;
+  size_t playbackSlotsToReturn = 0;
 
   while (true) {
     size_t queuedChunks = 0;
@@ -806,6 +809,20 @@ void playbackTask(void*) {
 
     std::vector<uint8_t> chunk;
     if (!dequeuePlayback(chunk)) {
+      if (!wsConnected) {
+        playbackSlotsToReturn = 0;
+        starvationStartedMs = 0;
+      } else {
+        if (playbackPrimed && !responsePlaybackComplete && starvationStartedMs == 0) {
+          starvationStartedMs = millis();
+        }
+        // Return even a partial batch when playback has caught the network.
+        // This also restores every queue slot before the next response.
+        if (playbackSlotsToReturn > 0) {
+          requestPlaybackAudio(playbackSlotsToReturn);
+          playbackSlotsToReturn = 0;
+        }
+      }
       if (playbackPrimed && millis() - lastChunkPlayedMs > PLAYBACK_IDLE_RESET_MS) {
         playbackPrimed = false;
         Serial.println("[playback] buffer drained");
@@ -827,6 +844,18 @@ void playbackTask(void*) {
       continue;
     }
 
+    if (starvationStartedMs != 0) {
+      Serial.printf("[playback] recovered after %lu ms without buffered audio\n",
+                    static_cast<unsigned long>(millis() - starvationStartedMs));
+      starvationStartedMs = 0;
+    }
+
+    playbackSlotsToReturn++;
+    if (playbackSlotsToReturn >= PLAYBACK_REFILL_BATCH_CHUNKS) {
+      requestPlaybackAudio(playbackSlotsToReturn);
+      playbackSlotsToReturn = 0;
+    }
+
     AudioMode currentAudioMode;
     portENTER_CRITICAL(&audioMux);
     currentAudioMode = audioMode;
@@ -843,8 +872,6 @@ void playbackTask(void*) {
       Serial.printf("[playback] primed with %u queued chunks\n",
                     static_cast<unsigned>(queuedChunks));
     }
-
-    requestPlaybackAudio(1);
 
     const size_t monoSamples = chunk.size() / sizeof(int16_t);
     std::vector<int16_t> stereoSamples;
