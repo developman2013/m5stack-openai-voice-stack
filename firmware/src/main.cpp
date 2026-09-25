@@ -7,6 +7,7 @@
 #include <Preferences.h>
 #include <HTTPClient.h>
 #include <driver/i2s.h>
+#include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
@@ -1099,6 +1100,7 @@ void connectWebSocket() {
 
 void setup() {
   Serial.begin(115200);
+  esp_log_level_set("wifi", ESP_LOG_NONE);
   delay(300);
   Serial.printf("[boot] firmware=%s\n", FIRMWARE_VERSION);
 
