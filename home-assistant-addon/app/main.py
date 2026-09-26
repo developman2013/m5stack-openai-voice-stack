@@ -57,6 +57,15 @@ WAKE_WORD_PORT = int(os.getenv("WAKE_WORD_PORT", "10400"))
 WAKE_WORD_NAME = os.getenv("WAKE_WORD_NAME", "hey_jarvis")
 WAKE_AUDIO_GAIN = max(1, int(os.getenv("WAKE_AUDIO_GAIN", "8")))
 FOLLOW_UP_TIMEOUT_MS = max(1000, int(os.getenv("FOLLOW_UP_TIMEOUT_MS", "5000")))
+STOP_PHRASES = {
+    "стоп", "хватит", "это всё", "это все", "всё", "все",
+    "спасибо всё", "спасибо все", "достаточно", "до свидания",
+}
+
+
+def is_stop_phrase(text: str) -> bool:
+    normalized = " ".join(text.casefold().strip().split()).strip(".!?,;:—- ")
+    return normalized in STOP_PHRASES
 
 HA_TOOL_DEFINITIONS = [
     {
@@ -869,6 +878,20 @@ async def relay(client_ws: WebSocket):
                     if event_type == "session.updated":
                         openai_ready.set()
                         log("OpenAI realtime session is ready")
+                    if event_type == "conversation.item.input_audio_transcription.completed":
+                        transcript = str(event.get("transcript", ""))
+                        if is_stop_phrase(transcript):
+                            log(f"conversation end phrase detected: {transcript!r}")
+                            await openai_ws.send(json.dumps({"type": "response.cancel"}))
+                            await openai_ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+                            pending_audio_events.clear()
+                            response_audio_done = True
+                            response_has_audio = False
+                            playback_complete_sent = True
+                            follow_up_requested = False
+                            async with client_send_lock:
+                                await client_ws.send_text(json.dumps({"type": "conversation.ended", "reason": "stop_phrase"}))
+                            continue
                     if event_type == "response.function_call_arguments.done":
                         pending_tool_calls[event["call_id"]] = event
                     if event_type == "response.done" and pending_tool_calls:

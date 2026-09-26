@@ -1,5 +1,5 @@
 name: OpenAI Voice Gateway
-version: "0.5.4"
+version: "0.5.5"
 slug: openai_voice_gateway
 description: Realtime OpenAI voice gateway with a browser demo and Home Assistant hooks
 url: https://github.com/developman2013/m5stack-openai-voice-stack
