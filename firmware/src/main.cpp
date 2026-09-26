@@ -708,6 +708,18 @@ void handleTextMessage(const char* payload) {
   }
 
   const char* type = doc["type"] | "";
+  if (strcmp(type, "conversation.ended") == 0) {
+    listening = false;
+    wakeListening = true;
+    commandAudioStartsAtMs = 0;
+    followUpDeadlineMs = 0;
+    responsePlaybackComplete = false;
+    stopAudioI2S();
+    setState(DeviceState::Idle);
+    refreshLed();
+    Serial.printf("[voice] conversation ended: %s\n", doc["reason"] | "unknown");
+    return;
+  }
   if (strcmp(type, "wake_word.detected") == 0) {
     if (!wakeListening) {
       return;
