@@ -65,7 +65,12 @@ STOP_PHRASES = {
 
 def is_stop_phrase(text: str) -> bool:
     normalized = " ".join(text.casefold().strip().split()).strip(".!?,;:—- ")
-    return normalized in STOP_PHRASES
+    return any(
+        normalized == phrase
+        or normalized.startswith(phrase + " ")
+        or (" " + phrase + " ") in (" " + normalized + " ")
+        for phrase in STOP_PHRASES
+    )
 
 HA_TOOL_DEFINITIONS = [
     {
@@ -880,6 +885,7 @@ async def relay(client_ws: WebSocket):
                         log("OpenAI realtime session is ready")
                     if event_type == "conversation.item.input_audio_transcription.completed":
                         transcript = str(event.get("transcript", ""))
+                        log(f"input transcript: {transcript!r}")
                         if is_stop_phrase(transcript):
                             log(f"conversation end phrase detected: {transcript!r}")
                             await openai_ws.send(json.dumps({"type": "response.cancel"}))
