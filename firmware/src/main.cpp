@@ -136,6 +136,7 @@ void processSerialProvisioning() {
       } else if (String(doc["ssid"] | "").isEmpty() || String(doc["gateway"] | "").isEmpty() || String(doc["token"] | "").isEmpty()) {
         Serial.println("{\"type\":\"provision.error\",\"message\":\"ssid, gateway and token are required\"}");
       } else {
+        Serial.println("{\"type\":\"provision.status\",\"message\":\"validation started\"}");
         WiFi.mode(WIFI_STA);
         WiFi.begin(doc["ssid"].as<const char*>(), doc["password"] | "");
         const uint32_t started = millis();
@@ -143,6 +144,7 @@ void processSerialProvisioning() {
         if (WiFi.status() != WL_CONNECTED) {
           Serial.println("{\"type\":\"provision.error\",\"message\":\"Wi-Fi connection failed\"}");
         } else {
+          Serial.println("{\"type\":\"provision.status\",\"message\":\"Wi-Fi connected; checking gateway\"}");
           String gateway = doc["gateway"].as<const char*>();
           if (!gateway.startsWith("http://") && !gateway.startsWith("https://")) gateway = "http://" + gateway;
           if (!gateway.endsWith("/")) gateway += ":" + String(GATEWAY_PORT);
